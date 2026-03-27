@@ -1,0 +1,3022 @@
+"""
+Work Log Journal  — Cross-Platform Web App
+==========================================
+Runs on Windows, macOS, iOS (Safari PWA), Android
+
+Setup:
+    pip install flask supabase python-docx Pillow
+
+Cloud DB (Supabase — free tier):
+    1. Create account at https://supabase.com
+    2. New project → SQL Editor → run schema.sql
+    3. Copy Project URL + anon key into .env or config below
+
+Run:
+    python app.py
+    Then open http://localhost:5000 on any device on the same network.
+    On iOS: Safari → Share → "Add to Home Screen" for PWA install.
+"""
+
+import sys
+import os, re, io, json, base64, hashlib, datetime
+from pathlib import Path
+
+# ── Read version from VERSION file (single source of truth) ──────────────────
+def _read_version() -> str:
+    try:
+        return (Path(__file__).parent / "VERSION").read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return "0.0.0"
+
+APP_VERSION = _read_version()
+
+# ── Load .env file (must happen before os.environ.get) ──────────────────────
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).parent / ".env"
+    load_dotenv(dotenv_path=_env_path, override=True)
+except ImportError:
+    pass  # python-dotenv not installed — use os environment only
+
+from flask import Flask, request, jsonify, render_template_string, send_file
+
+# ── Optional cloud DB (Supabase) ────────────────────────────────────────────
+try:
+    from supabase import create_client
+    HAS_SUPABASE = True
+except ImportError:
+    HAS_SUPABASE = False
+
+# ── Optional Word export ─────────────────────────────────────────────────────
+try:
+    from docx import Document as DocxDocument
+    from docx.shared import Pt, RGBColor, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+
+# ── Optional Excel export ─────────────────────────────────────────────────────
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    HAS_EXCEL = True
+except ImportError:
+    HAS_EXCEL = False
+
+# ── Optional PDF export ──────────────────────────────────────────────────────
+try:
+    from fpdf import FPDF
+    HAS_PDF = True
+except ImportError:
+    HAS_PDF = False
+
+# ── Optional image support ───────────────────────────────────────────────────
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+import sqlite3
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "worklog-dev-key-change-in-prod")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION  — edit these or set as environment variables
+# ─────────────────────────────────────────────────────────────────────────────
+SUPABASE_URL  = os.environ.get("SUPABASE_URL",  "")
+SUPABASE_KEY  = os.environ.get("SUPABASE_KEY",  "")
+TABLE         = "worklog"
+
+# Resolve DB path relative to the executable (works both packaged and in dev)
+def _resolve_db_path() -> str:
+    custom = os.environ.get("SQLITE_PATH", "")
+    if custom:
+        return custom
+    if getattr(sys, 'frozen', False):
+        # PyInstaller bundle: store next to the .exe
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).parent
+    return str(base / "WorkLog.db")
+
+SQLITE_PATH = _resolve_db_path()
+
+STATUS_OPTIONS   = ["Not Started","Early Engagement","WIP","Production",
+                    "Cancelled","No More Activity","Task Done"]
+CATEGORY_OPTIONS = ["General","Visit","Training","Tech Support","Design Review",
+                    "Debug","Documentation","Design-in","Evaluation","Follow-up",
+                    "Design-win","Others"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATABASE — OFFLINE-FIRST HYBRID
+# ─────────────────────────────────────────────────────────────────────────────
+"""
+Architecture:
+  LocalDB  — always used for reads/writes (SQLite, always fast, works offline)
+  CloudDB  — Supabase, used only when online
+  SyncEngine — background thread; pushes pending_sync rows to cloud,
+               detects conflicts by comparing last_update timestamps,
+               pulls new/updated cloud rows not yet in local cache.
+
+Every write to LocalDB stamps the row with:
+  sync_status: 'pending' | 'synced' | 'conflict'
+  local_updated_at: ISO timestamp of local write (for conflict detection)
+"""
+
+import threading as _threading
+
+_sync_lock = _threading.Lock()
+
+
+class LocalDB:
+    """
+    SQLite — always the primary read/write store.
+    Adds sync_status + local_updated_at columns for offline tracking.
+    """
+    def __init__(self, path=None):
+        self.path = path or SQLITE_PATH
+        self._init()
+
+    def _conn(self):
+        c = sqlite3.connect(self.path, check_same_thread=False)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA journal_mode=WAL")
+        return c
+
+    def _init(self):
+        c = self._conn()
+        try:
+            c.execute("""CREATE TABLE IF NOT EXISTS worklog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                week TEXT, due_date TEXT, customer TEXT, project_name TEXT,
+                sso_modeln TEXT, ear TEXT, application TEXT, bu TEXT,
+                task_summary TEXT, mchp_device TEXT, project_schedule TEXT,
+                status TEXT, category TEXT,
+                worklogs TEXT, create_date TEXT, last_update TEXT,
+                archive TEXT DEFAULT 'No', record_hash TEXT,
+                cloud_id TEXT,
+                sync_status TEXT DEFAULT 'pending',
+                local_updated_at TEXT
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS sync_conflicts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                local_id INTEGER,
+                cloud_snapshot TEXT,
+                detected_at TEXT,
+                conflict_type TEXT DEFAULT 'normal'
+            )""")
+            cur = c.execute("PRAGMA table_info(worklog)")
+            cols = {r[1] for r in cur.fetchall()}
+            for col, dtype in [
+                ("due_date","TEXT"),("record_hash","TEXT"),("category","TEXT"),
+                ("mchp_device","TEXT"),("cloud_id","TEXT"),
+                ("sync_status","TEXT"),("local_updated_at","TEXT"),
+                ("sso_modeln","TEXT"),("ear","TEXT"),("application","TEXT"),("bu","TEXT"),
+                ("project_schedule","TEXT"),
+            ]:
+                if col not in cols:
+                    c.execute(f"ALTER TABLE worklog ADD COLUMN {col} {dtype}")
+            # Migrate sync_conflicts table
+            cur2 = c.execute("PRAGMA table_info(sync_conflicts)")
+            conflict_cols = {r[1] for r in cur2.fetchall()}
+            if "conflict_type" not in conflict_cols:
+                c.execute("ALTER TABLE sync_conflicts ADD COLUMN conflict_type TEXT DEFAULT 'normal'")
+            c.commit()
+        finally:
+            c.close()
+
+    def fetch_all(self, filters=None):
+        sql = "SELECT * FROM worklog WHERE IFNULL(sync_status, 'pending') != 'deleted'"
+        params = []
+        if filters:
+            clauses = []
+            for col, val in filters.items():
+                if val:
+                    if col in ("customer","project_name"):
+                        clauses.append(f"{col} LIKE ?"); params.append(f"%{val}%")
+                    else:
+                        clauses.append(f"{col}=?"); params.append(val)
+            if clauses:
+                sql += " AND " + " AND ".join(clauses)
+        sql += " ORDER BY id DESC"
+        c = self._conn()
+        try:
+            return [dict(r) for r in c.execute(sql, params).fetchall()]
+        finally:
+            c.close()
+
+    def _now_iso(self):
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")
+
+    def insert(self, data):
+        data = dict(data)
+        data.setdefault("sync_status", "pending")
+        data["local_updated_at"] = self._now_iso()
+        cols = ", ".join(data.keys())
+        phs  = ", ".join(["?"]*len(data))
+        c = self._conn()
+        try:
+            cur = c.execute(f"INSERT INTO worklog ({cols}) VALUES ({phs})",
+                            list(data.values()))
+            c.commit()
+            return {**data, "id": cur.lastrowid}
+        except Exception as e:
+            c.rollback(); raise e
+        finally:
+            c.close()
+
+    def update(self, row_id, data):
+        data = dict(data)
+        data["sync_status"]     = "pending"
+        data["local_updated_at"] = self._now_iso()
+        sets = ", ".join([f"{k}=?" for k in data])
+        c = self._conn()
+        try:
+            c.execute(f"UPDATE worklog SET {sets} WHERE id=?",
+                      list(data.values()) + [row_id])
+            c.commit()
+        except Exception as e:
+            c.rollback(); raise e
+        finally:
+            c.close()
+        return {**data, "id": row_id}
+
+    def delete(self, row_id):
+        """Soft-delete: mark as 'deleted' so sync can propagate to cloud."""
+        c = self._conn()
+        try:
+            c.execute("UPDATE worklog SET sync_status='deleted' WHERE id=?", (row_id,))
+            c.commit()
+        finally:
+            c.close()
+
+    def find_by_hash(self, h):
+        c = self._conn()
+        try:
+            rows = c.execute(
+                "SELECT * FROM worklog WHERE record_hash=? AND sync_status!='deleted'",
+                (h,)).fetchall()
+            return dict(rows[0]) if rows else None
+        finally:
+            c.close()
+
+    def find_by_cloud_id(self, cloud_id):
+        c = self._conn()
+        try:
+            rows = c.execute("SELECT * FROM worklog WHERE cloud_id=?",
+                             (str(cloud_id),)).fetchall()
+            return dict(rows[0]) if rows else None
+        finally:
+            c.close()
+
+    def mark_synced(self, local_id, cloud_id):
+        c = self._conn()
+        try:
+            c.execute("UPDATE worklog SET sync_status='synced', cloud_id=? WHERE id=?",
+                      (str(cloud_id), local_id))
+            c.commit()
+        finally:
+            c.close()
+
+    def mark_conflict(self, local_id, cloud_snapshot: dict, conflict_type: str = "normal"):
+        """Store the conflicting cloud version as JSON in a side table.
+        conflict_type: 'normal' (timestamp-based) or 'unresolvable' (requires user decision)
+        """
+        c = self._conn()
+        try:
+            c.execute(
+                "INSERT INTO sync_conflicts (local_id, cloud_snapshot, detected_at, conflict_type) VALUES (?,?,?,?)",
+                (local_id, json.dumps(cloud_snapshot),
+                 datetime.datetime.now(datetime.timezone.utc).isoformat(), conflict_type))
+            c.execute("UPDATE worklog SET sync_status='conflict' WHERE id=?", (local_id,))
+            c.commit()
+        finally:
+            c.close()
+
+    def get_conflicts(self):
+        c = self._conn()
+        try:
+            rows = c.execute("""
+                SELECT sc.id as conflict_id, sc.local_id, sc.cloud_snapshot,
+                       sc.detected_at, sc.conflict_type, w.*
+                FROM sync_conflicts sc
+                JOIN worklog w ON w.id = sc.local_id
+                ORDER BY sc.detected_at DESC
+            """).fetchall()
+            result = []
+            for r in rows:
+                d = dict(r)
+                d["cloud_snapshot"] = json.loads(d["cloud_snapshot"] or "{}")
+                result.append(d)
+            return result
+        finally:
+            c.close()
+
+    def resolve_conflict(self, conflict_id: int, keep: str):
+        """keep: 'local', 'cloud', or 'backup' (keep both versions)"""
+        c = self._conn()
+        try:
+            row = dict(c.execute(
+                "SELECT * FROM sync_conflicts WHERE id=?", (conflict_id,)).fetchone())
+            local_id      = row["local_id"]
+            cloud_snapshot = json.loads(row["cloud_snapshot"])
+
+            if keep == "cloud":
+                # Overwrite local with cloud version, mark synced
+                snap = dict(cloud_snapshot)
+                snap.pop("id", None)
+                snap["sync_status"]     = "synced"
+                snap["local_updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                snap["cloud_id"]        = str(cloud_snapshot.get("id",""))
+                sets = ", ".join([f"{k}=?" for k in snap])
+                c.execute(f"UPDATE worklog SET {sets} WHERE id=?",
+                          list(snap.values()) + [local_id])
+            elif keep == "backup":
+                # Keep local as-is, and insert cloud version as a new backup record
+                snap = dict(cloud_snapshot)
+                snap.pop("id", None)
+                snap.pop("created_at", None)
+                snap["sync_status"]     = "synced"
+                snap["local_updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                snap["cloud_id"]        = str(cloud_snapshot.get("id",""))
+                # Add "(Backup)" suffix to identify backup copies
+                if snap.get("customer"):
+                    snap["customer"] = snap["customer"] + " (Backup)"
+                cols = ", ".join(snap.keys())
+                phs  = ", ".join(["?"]*len(snap))
+                c.execute(f"INSERT INTO worklog ({cols}) VALUES ({phs})", list(snap.values()))
+                # Mark original local as pending
+                c.execute("UPDATE worklog SET sync_status='pending' WHERE id=?", (local_id,))
+            else:
+                # Keep local, mark pending so it gets pushed to cloud
+                c.execute(
+                    "UPDATE worklog SET sync_status='pending' WHERE id=?", (local_id,))
+
+            c.execute("DELETE FROM sync_conflicts WHERE id=?", (conflict_id,))
+            c.commit()
+        finally:
+            c.close()
+
+    def pending_rows(self):
+        c = self._conn()
+        try:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM worklog WHERE sync_status IN ('pending','deleted')"
+            ).fetchall()]
+        finally:
+            c.close()
+
+
+# ── Single shared LocalDB instance ────────────────────────────────────────────
+_local_db = None
+
+def _get_local_db() -> LocalDB:
+    global _local_db, SQLITE_PATH
+    # Re-resolve path in case env was updated by launcher after module load
+    SQLITE_PATH = _resolve_db_path()
+    if _local_db is None or _local_db.path != SQLITE_PATH:
+        _local_db = LocalDB(path=SQLITE_PATH)
+    return _local_db
+
+
+def _has_local_data() -> bool:
+    """True if the local DB already has at least one non-deleted record."""
+    try:
+        return len(_get_local_db().fetch_all()) > 0
+    except Exception:
+        return False
+
+
+# ── Cloud connectivity check ──────────────────────────────────────────────────
+def _is_online() -> bool:
+    """True when Supabase is reachable and credentials are valid."""
+    if not _supabase_configured():
+        return False
+    url = os.environ.get("SUPABASE_URL", SUPABASE_URL)
+    key = os.environ.get("SUPABASE_KEY", SUPABASE_KEY)
+    try:
+        import urllib.request, urllib.error
+        req_url = url.rstrip("/") + f"/rest/v1/{TABLE}?select=id&limit=1"
+        req = urllib.request.Request(req_url, headers={
+            "apikey":        key,
+            "Authorization": f"Bearer {key}",
+        }, method="HEAD")
+        with urllib.request.urlopen(req, timeout=5):
+            return True
+    except urllib.error.HTTPError as e:
+        return e.code in (200, 204, 406)
+    except Exception:
+        return False
+
+
+def _cloud_client():
+    """Always read SUPABASE_URL/KEY from env at call time so launcher-set values work."""
+    url = os.environ.get("SUPABASE_URL", SUPABASE_URL)
+    key = os.environ.get("SUPABASE_KEY", SUPABASE_KEY)
+    return create_client(url, key)
+
+
+def _supabase_configured() -> bool:
+    """Check live env vars, not the cached module-level ones."""
+    return bool(
+        HAS_SUPABASE
+        and os.environ.get("SUPABASE_URL", SUPABASE_URL)
+        and os.environ.get("SUPABASE_KEY", SUPABASE_KEY)
+    )
+
+
+# ── Sync engine ───────────────────────────────────────────────────────────────
+class SyncEngine:
+    """
+    Background worker:
+      • Every 30 s: checks connectivity, pushes pending rows, pulls remote changes.
+      • Conflict = local pending AND cloud version has a newer last_update.
+        → stores conflict, flags row; user resolves via /api/sync/conflicts.
+    """
+    INTERVAL = 30    # seconds between sync attempts
+
+    def __init__(self):
+        self._stop   = _threading.Event()
+        self._thread = _threading.Thread(target=self._loop, daemon=True)
+        self._status = {"online": False, "last_sync": None,
+                        "pending": 0, "conflicts": 0}
+
+    def start(self):
+        self._thread.start()
+        # On first start: if we have Supabase configured and no local data yet,
+        # do an immediate pull so the user sees cloud data right away.
+        _threading.Thread(target=self._initial_pull, daemon=True).start()
+
+    def _create_cloud_backup(self):
+        """Create a JSON backup of all cloud data in the local directory."""
+        try:
+            sb = _cloud_client()
+            if not sb:
+                return
+            cloud_rows = sb.table(TABLE).select("*").execute().data or []
+            if cloud_rows:
+                backup_dir = os.path.dirname(SQLITE_PATH)
+                backup_file = os.path.join(backup_dir, f"supabase_backup_{datetime.date.today().strftime('%Y%m%d')}.json")
+                with open(backup_file, "w", encoding="utf-8") as f:
+                    json.dump(cloud_rows, f, ensure_ascii=False, indent=2, default=str)
+                print(f"  Cloud backup created: {backup_file}")
+        except Exception as e:
+            print(f"  Cloud backup failed: {e}")
+
+    def _initial_pull(self):
+        """Pull all cloud data into local on first launch (empty local DB)."""
+        import time as _time
+        # Give Flask a moment to finish starting
+        _time.sleep(2)
+        if _is_online():
+            # Always create a backup of cloud data when online
+            self._create_cloud_backup()
+            if not _has_local_data():
+                report = {"pushed": 0, "pulled": 0, "conflicts": 0, "errors": []}
+                with _sync_lock:
+                    try:
+                        self._pull(report)
+                        if report["pulled"]:
+                            self._status["last_sync"] = datetime.datetime.now().strftime(
+                                "%Y-%m-%d %H:%M:%S")
+                            self._status["online"] = True
+                    except Exception as e:
+                        report["errors"].append(str(e))
+
+    def stop(self):
+        self._stop.set()
+
+    def status(self) -> dict:
+        db = _get_local_db()
+        pending   = len([r for r in db.pending_rows() if r["sync_status"]=="pending"])
+        conflicts = len(db.get_conflicts())
+        self._status.update({"pending": pending, "conflicts": conflicts})
+        return dict(self._status)
+
+    def _loop(self):
+        while not self._stop.wait(self.INTERVAL):
+            self.sync_now()
+
+    def sync_now(self) -> dict:
+        if not _is_online():
+            self._status["online"] = False
+            return {"ok": False, "reason": "offline"}
+
+        self._status["online"] = True
+        report = {"pushed": 0, "pulled": 0, "conflicts": 0, "errors": []}
+
+        with _sync_lock:
+            try:
+                self._push(report)
+                self._pull(report)
+                self._status["last_sync"] = datetime.datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S")
+                self._status["pending"]   = 0
+            except Exception as e:
+                report["errors"].append(str(e))
+
+        return report
+
+    # ── Push pending local rows to Supabase ───────────────────────────────────
+    def _push(self, report: dict):
+        db  = _get_local_db()
+        sb  = _cloud_client()
+        pending = db.pending_rows()
+
+        for row in pending:
+            local_id = row["id"]
+            cloud_id = row.get("cloud_id")
+
+            # Soft-deleted rows
+            if row["sync_status"] == "deleted":
+                if cloud_id:
+                    try:
+                        sb.table(TABLE).delete().eq("id", cloud_id).execute()
+                    except Exception:
+                        pass
+                c = db._conn()
+                c.execute("DELETE FROM worklog WHERE id=?", (local_id,))
+                c.commit(); c.close()
+                report["pushed"] += 1
+                continue
+
+            # Prepare payload — strip local-only columns
+            payload = {k: v for k, v in row.items()
+                       if k not in ("id","cloud_id","sync_status","local_updated_at")}
+
+            # Note: Ensure your Supabase database has been updated with new columns
+            # Run the migration SQL in schema.sql if you haven't already
+
+            if cloud_id:
+                # Check for conflict: compare timestamps (use local_updated_at for precision)
+                cloud_rows = sb.table(TABLE).select("id,last_update,created_at").eq(
+                    "id", cloud_id).execute().data
+                if cloud_rows:
+                    cloud_lu = (cloud_rows[0].get("last_update") or "")
+                    local_lu = (row.get("last_update") or "")
+                    local_updated = (row.get("local_updated_at") or "")
+
+                    # Enhanced conflict resolution based on timestamps
+                    if cloud_lu and local_lu:
+                        if cloud_lu > local_lu:
+                            # Cloud is newer - check if we should auto-resolve or flag for user
+                            full = sb.table(TABLE).select("*").eq("id", cloud_id).execute().data
+                            if full:
+                                db.mark_conflict(local_id, full[0])
+                                report["conflicts"] += 1
+                                continue
+                        elif cloud_lu == local_lu and local_updated:
+                            # Same last_update but local has been modified - local wins (more recent edit)
+                            pass  # Continue to push
+                        # else: local is newer or equal, push local changes
+                    elif not cloud_lu and not local_lu:
+                        # Both timestamps missing - flag as unresolvable conflict for user decision
+                        full = sb.table(TABLE).select("*").eq("id", cloud_id).execute().data
+                        if full:
+                            db.mark_conflict(local_id, full[0], conflict_type="unresolvable")
+                            report["conflicts"] += 1
+                            continue
+                try:
+                    sb.table(TABLE).update(payload).eq("id", cloud_id).execute()
+                    db.mark_synced(local_id, cloud_id)
+                    report["pushed"] += 1
+                except Exception as e:
+                    report["errors"].append(f"update {local_id}: {e}")
+            else:
+                try:
+                    result = sb.table(TABLE).insert(payload).execute().data
+                    if result:
+                        new_cloud_id = result[0]["id"]
+                        db.mark_synced(local_id, new_cloud_id)
+                        report["pushed"] += 1
+                except Exception as e:
+                    report["errors"].append(f"insert {local_id}: {e}")
+
+    # ── Pull cloud rows into local cache ──────────────────────────────────────
+    def _normalize_cloud_row(self, row: dict) -> dict:
+        """Map old Supabase column names to new local schema."""
+        # Map old 'inquiries' to new 'mchp_device' if cloud still has old schema
+        if "inquiries" in row and "mchp_device" not in row:
+            row["mchp_device"] = row.pop("inquiries")
+        # Ensure new columns have defaults if missing from cloud
+        row.setdefault("ear", "")
+        row.setdefault("bu", "")
+        row.setdefault("mchp_device", "")
+        row.setdefault("sso_modeln", "")
+        row.setdefault("application", "")
+        row.setdefault("project_schedule", "")
+        return row
+
+    def _pull(self, report: dict):
+        db = _get_local_db()
+        sb = _cloud_client()
+
+        # Fetch ALL cloud rows; use last_update (not updated_at) to decide freshness
+        try:
+            cloud_rows = sb.table(TABLE).select("*").order(
+                "id", desc=False).execute().data or []
+        except Exception as e:
+            report["errors"].append(f"pull fetch: {e}")
+            return
+
+        for crow in cloud_rows:
+            crow = self._normalize_cloud_row(crow)
+            cloud_id = str(crow["id"])
+            local    = db.find_by_cloud_id(cloud_id)
+
+            if local is None:
+                # New cloud row not yet in local
+                payload = {k: v for k, v in crow.items()
+                           if k not in ("created_at",)}
+                payload.pop("id", None)
+                payload["cloud_id"]        = cloud_id
+                payload["sync_status"]     = "synced"
+                payload["local_updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                # Remove unknown columns
+                for col in ("updated_at", "inquiries"):
+                    payload.pop(col, None)
+                try:
+                    db.insert(payload)
+                    report["pulled"] += 1
+                except Exception as e:
+                    report["errors"].append(f"pull insert {cloud_id}: {e}")
+            elif local["sync_status"] == "synced":
+                cloud_lu = crow.get("last_update") or ""
+                local_lu = local.get("last_update") or ""
+                if cloud_lu and cloud_lu > local_lu:
+                    payload = {k: v for k, v in crow.items()
+                               if k not in ("id","created_at","updated_at","inquiries")}
+                    payload["cloud_id"]        = cloud_id
+                    payload["sync_status"]     = "synced"
+                    payload["local_updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    # Filter only valid local columns
+                    valid_cols = {"week","due_date","customer","project_name","sso_modeln",
+                                  "ear","application","bu","task_summary","mchp_device",
+                                  "status","category","worklogs","create_date","last_update",
+                                  "archive","record_hash","cloud_id","sync_status","local_updated_at"}
+                    payload = {k: v for k, v in payload.items() if k in valid_cols}
+                    sets = ", ".join([f"{k}=?" for k in payload])
+                    c = db._conn()
+                    c.execute(f"UPDATE worklog SET {sets} WHERE id=?",
+                              list(payload.values()) + [local["id"]])
+                    c.commit(); c.close()
+                    report["pulled"] += 1
+
+
+# ── Global sync engine — always starts; silently skips cycles when offline ────
+_sync_engine = SyncEngine()
+
+def get_db():
+    """Always return the local DB. Sync runs in background."""
+    return _get_local_db()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def make_hash(customer, project):
+    key = f"{(customer or '').strip().lower()}|||{(project or '').strip().lower()}"
+    return hashlib.md5(key.encode()).hexdigest()
+
+def week_number(date_str):
+    try:
+        d = datetime.datetime.strptime(date_str, "%m-%d-%Y")
+        return str(d.isocalendar()[1])
+    except Exception:
+        return ""
+
+def today_str():
+    return datetime.date.today().strftime("%m-%d-%Y")
+
+def parse_worklog_entries(text):
+    if not text: return []
+    # Support both old `── YYYY-MM-DD HH:MM ──` and new `── YYYY-MM-DD ──`
+    pattern = re.compile(r'── (\d{4}-\d{2}-\d{2})(?: \d{2}:\d{2})? ──')
+    parts = pattern.split(text.strip())
+    entries = []
+    i = 1
+    while i + 1 < len(parts):
+        try:
+            dt = datetime.datetime.strptime(parts[i].strip(), "%Y-%m-%d")
+        except Exception:
+            dt = datetime.datetime.min
+        if parts[i+1].strip():
+            entries.append((dt, parts[i+1].strip()))
+        i += 2
+    return entries
+
+def merge_worklogs(a, b):
+    all_e = parse_worklog_entries(a) + parse_worklog_entries(b)
+    seen, unique = set(), []
+    for dt, c in all_e:
+        if c.strip() not in seen:
+            seen.add(c.strip()); unique.append((dt, c))
+    unique.sort(key=lambda x: x[0])
+    return "\n\n".join(f"── {dt.strftime('%Y-%m-%d')} ──\n{c}" for dt, c in unique)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/api/records", methods=["GET"])
+def api_list():
+    filters = {k: request.args.get(k,"") for k in
+               ("customer","project_name","status","category","archive")}
+    return jsonify(get_db().fetch_all(filters))
+
+@app.route("/api/records", methods=["POST"])
+def api_create():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data received"}), 400
+        data["week"]        = week_number(data.get("last_update","") or today_str())
+        data["record_hash"] = make_hash(data.get("customer",""), data.get("project_name",""))
+        data.setdefault("create_date", today_str())
+        data.setdefault("last_update", today_str())
+        result = get_db().insert(data)
+        return jsonify(result), 201
+    except Exception as e:
+        app.logger.error(f"Insert error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/records/<int:rid>", methods=["PUT"])
+def api_update(rid):
+    try:
+        data = request.json
+        data["week"]        = week_number(data.get("last_update","") or today_str())
+        data["record_hash"] = make_hash(data.get("customer",""), data.get("project_name",""))
+        result = get_db().update(rid, data)
+        return jsonify(result)
+    except Exception as e:
+        app.logger.error(f"Update error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/debug/db")
+def api_debug():
+    """Quick health check — shows row count and DB path."""
+    try:
+        db = get_db()
+        rows = db.fetch_all()
+        return jsonify({"ok": True, "count": len(rows), "type": type(db).__name__,
+                        "path": getattr(db, "path", "cloud")})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/api/records/<int:rid>", methods=["DELETE"])
+def api_delete(rid):
+    get_db().delete(rid)
+    return jsonify({"ok": True})
+
+@app.route("/api/import", methods=["POST"])
+def api_import():
+    """Accept a JSON array of records and merge into current DB."""
+    rows = request.json or []
+    db = get_db()
+    added = merged = skipped = 0
+    results = []
+    for row in rows:
+        h = make_hash(row.get("customer",""), row.get("project_name",""))
+        existing = db.find_by_hash(h)
+        if existing is None:
+            row.pop("id", None); row["record_hash"] = h
+            db.insert(row); added += 1
+            results.append({"status":"added","customer":row.get("customer",""),
+                            "project":row.get("project_name","")})
+        else:
+            mwl = merge_worklogs(existing.get("worklogs",""), row.get("worklogs",""))
+            if mwl != (existing.get("worklogs","") or ""):
+                upd = dict(existing); eid = upd.pop("id")
+                upd["worklogs"] = mwl; upd["last_update"] = today_str()
+                db.update(eid, upd); merged += 1
+                results.append({"status":"merged","customer":row.get("customer",""),
+                                "project":row.get("project_name","")})
+            else:
+                skipped += 1
+                results.append({"status":"skipped","customer":row.get("customer",""),
+                                "project":row.get("project_name","")})
+    return jsonify({"added":added,"merged":merged,"skipped":skipped,"results":results})
+
+@app.route("/api/sync/init", methods=["GET"])
+def api_sync_init():
+    """Called by frontend on page load — triggers initial pull if local DB is empty."""
+    has_data = _has_local_data()
+    online   = _is_online()
+    return jsonify({
+        "has_local_data": has_data,
+        "online":         online,
+        "db_path":        SQLITE_PATH,
+    })
+
+@app.route("/api/sync/status", methods=["GET"])
+def api_sync_status():
+    return jsonify(_sync_engine.status())
+
+@app.route("/api/sync/test", methods=["GET"])
+def api_sync_test():
+    """Verify connectivity and return detailed diagnostics."""
+    configured = _supabase_configured()
+    online     = _is_online() if configured else False
+    url        = os.environ.get("SUPABASE_URL", SUPABASE_URL)
+    return jsonify({
+        "configured": configured,
+        "online":     online,
+        "url":        url[:40] + "…" if len(url) > 40 else url,
+        "has_supabase_lib": HAS_SUPABASE,
+    })
+
+@app.route("/api/sync/now", methods=["POST"])
+def api_sync_now():
+    """Trigger an immediate sync attempt."""
+    report = _sync_engine.sync_now()
+    return jsonify(report)
+
+@app.route("/api/sync/conflicts", methods=["GET"])
+def api_sync_conflicts():
+    """Return all unresolved conflicts."""
+    conflicts = _get_local_db().get_conflicts()
+    return jsonify(conflicts)
+
+@app.route("/api/sync/conflicts/<int:conflict_id>", methods=["POST"])
+def api_sync_resolve(conflict_id):
+    """
+    Resolve a conflict.
+    Body: { "keep": "local" | "cloud" | "backup" }
+    """
+    keep = (request.json or {}).get("keep", "local")
+    if keep not in ("local", "cloud", "backup"):
+        return jsonify({"error": "keep must be 'local', 'cloud', or 'backup'"}), 400
+    _get_local_db().resolve_conflict(conflict_id, keep)
+    # If keeping local or backup, trigger immediate sync push
+    if keep in ("local", "backup"):
+        _threading.Thread(target=_sync_engine.sync_now, daemon=True).start()
+    return jsonify({"ok": True, "kept": keep})
+
+@app.route("/api/config", methods=["GET"])
+def api_config():
+    sync = _sync_engine.status()
+    return jsonify({
+        "status_options":   STATUS_OPTIONS,
+        "category_options": CATEGORY_OPTIONS,
+        "today":            today_str(),
+        "db_type":          "Supabase + Local Cache" if _supabase_configured() else "SQLite (local only)",
+        "has_docx":         HAS_DOCX,
+        "version":          APP_VERSION,
+        "sync":             sync,
+    })
+
+# Always start the sync engine — it checks connectivity internally each cycle
+_sync_engine.start()
+
+
+@app.route("/api/export/weeks", methods=["POST"])
+def api_export_weeks():
+    """Return available weeks from selected records' worklogs."""
+    body = request.json or {}
+    ids  = body.get("ids", [])
+    all_rows = get_db().fetch_all()
+
+    if ids:
+        id_set = set(int(i) for i in ids)
+        rows = [r for r in all_rows if int(r.get("id", 0)) in id_set]
+    else:
+        rows = all_rows
+
+    # Collect all unique (year, week) from worklog entries
+    weeks_set = set()
+    for row in rows:
+        for dt, _ in parse_worklog_entries(row.get("worklogs") or ""):
+            if dt.year > 1970:
+                weeks_set.add((dt.isocalendar()[0], dt.isocalendar()[1]))
+
+    # Sort descending (newest first)
+    weeks_list = sorted(weeks_set, reverse=True)
+
+    # Build response with date ranges
+    result = []
+    for year, week in weeks_list:
+        mon, fri = _week_date_range(year, week)
+        result.append({
+            "year": year,
+            "week": week,
+            "label": f"Week {week}, {year}",
+            "range": f"{mon.strftime('%m/%d')} – {fri.strftime('%m/%d')}",
+            "value": f"{year}-W{week:02d}"
+        })
+
+    return jsonify(result)
+
+
+@app.route("/api/export/word", methods=["POST"])
+def api_export_word():
+    if not HAS_DOCX:
+        return jsonify({"error": "python-docx not installed — run: pip install python-docx"}), 500
+    try:
+        body     = request.json or {}
+        ids      = body.get("ids", [])       # list of record IDs to export
+        week_str = body.get("week", "")      # optional: "YYYY-WNN" format
+        all_rows = get_db().fetch_all()
+
+        # Filter to selected IDs only
+        if ids:
+            id_set = set(int(i) for i in ids)
+            rows   = [r for r in all_rows if int(r.get("id", 0)) in id_set]
+        else:
+            rows = all_rows
+
+        if not rows:
+            return jsonify({"error": "No records match the selection"}), 400
+
+        # Parse week parameter if provided
+        target_year, target_week = None, None
+        if week_str and week_str != "all":
+            try:
+                # Format: "YYYY-WNN"
+                parts = week_str.split("-W")
+                target_year = int(parts[0])
+                target_week = int(parts[1])
+            except (ValueError, IndexError):
+                pass
+
+        buf = io.BytesIO()
+        _build_word_doc(rows, buf, target_year=target_year, target_week=target_week)
+        buf.seek(0)
+        if buf.getbuffer().nbytes < 100:
+            return jsonify({"error": "Document generation produced empty output"}), 500
+
+        fname = f"WorkLog_{datetime.date.today().strftime('%Y%m%d')}.docx"
+        return send_file(buf, as_attachment=True, download_name=fname,
+                         mimetype="application/vnd.openxmlformats-officedocument"
+                                   ".wordprocessingml.document")
+    except Exception as e:
+        app.logger.error(f"Word export error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/export/excel", methods=["POST"])
+def api_export_excel():
+    """Export selected records to Excel with column mapping."""
+    if not HAS_EXCEL:
+        return jsonify({"error": "openpyxl not installed — run: pip install openpyxl"}), 500
+    try:
+        body = request.json or {}
+        ids = body.get("ids", [])
+        all_rows = get_db().fetch_all()
+
+        if ids:
+            id_set = set(int(i) for i in ids)
+            rows = [r for r in all_rows if int(r.get("id", 0)) in id_set]
+        else:
+            rows = all_rows
+
+        if not rows:
+            return jsonify({"error": "No records to export"}), 400
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "WorkLog"
+
+        # Column mapping: DB field -> Excel header (only specified columns per CHANGELOG)
+        columns = [
+            ("customer", "OEM/ODM/OBM/Disti"),
+            ("sso_modeln", "SSO#"),
+            ("project_name", "Project Name"),
+            ("application", "Application"),
+            ("bu", "BU"),
+            ("mchp_device", "Microchip Devices"),
+            ("task_summary", "Status/Update"),
+            ("ear", "EAR(K$)"),
+            ("project_schedule", "Timeline"),
+        ]
+
+        # Header style
+        header_fill = PatternFill(start_color="1E3A5F", end_color="1E3A5F", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        thin_border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
+        )
+
+        # Write headers
+        for col_idx, (_, header) in enumerate(columns, 1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+
+        # Write data
+        for row_idx, row in enumerate(rows, 2):
+            for col_idx, (field, _) in enumerate(columns, 1):
+                value = row.get(field, "") or ""
+                cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                cell.border = thin_border
+                cell.alignment = Alignment(vertical='top', wrap_text=True)
+
+        # Auto-adjust column widths
+        for col_idx, (_, header) in enumerate(columns, 1):
+            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 15
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        fname = f"WorkLog_{datetime.date.today().strftime('%Y%m%d')}.xlsx"
+        return send_file(buf, as_attachment=True, download_name=fname,
+                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception as e:
+        app.logger.error(f"Excel export error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/export/pdf", methods=["POST"])
+def api_export_pdf():
+    """Export selected records to PDF."""
+    if not HAS_PDF:
+        return jsonify({"error": "fpdf2 not installed — run: pip install fpdf2"}), 500
+    try:
+        body = request.json or {}
+        ids = body.get("ids", [])
+        all_rows = get_db().fetch_all()
+
+        if ids:
+            id_set = set(int(i) for i in ids)
+            rows = [r for r in all_rows if int(r.get("id", 0)) in id_set]
+        else:
+            rows = all_rows
+
+        if not rows:
+            return jsonify({"error": "No records to export"}), 400
+
+        pdf = FPDF(orientation='L', unit='mm', format='A4')
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+
+        # Title
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(0, 10, "Work Log Report", ln=True, align='C')
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 6, f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}  |  {len(rows)} record(s)", ln=True, align='C')
+        pdf.ln(5)
+
+        # Column headers (matching Excel export per CHANGELOG v0.9.5)
+        headers = ["OEM/ODM/OBM/Disti", "SSO#", "Project", "Application", "BU", "MCHP Devices", "Status/Update", "EAR(K$)", "Timeline"]
+        col_widths = [32, 18, 28, 32, 14, 32, 50, 18, 26]
+
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_fill_color(30, 58, 95)
+        pdf.set_text_color(255, 255, 255)
+        for i, header in enumerate(headers):
+            pdf.cell(col_widths[i], 8, header, border=1, align='C', fill=True)
+        pdf.ln()
+
+        # Data rows
+        pdf.set_font("Helvetica", "", 7)
+        pdf.set_text_color(0, 0, 0)
+        for row in rows:
+            data = [
+                (row.get("customer") or "")[:28],
+                (row.get("sso_modeln") or "")[:14],
+                (row.get("project_name") or "")[:24],
+                (row.get("application") or "")[:28],
+                (row.get("bu") or "")[:10],
+                (row.get("mchp_device") or "")[:28],
+                (row.get("task_summary") or "")[:45],
+                (row.get("ear") or "")[:14],
+                (row.get("project_schedule") or "")[:22],
+            ]
+            for i, val in enumerate(data):
+                pdf.cell(col_widths[i], 6, val, border=1, align='L')
+            pdf.ln()
+
+        buf = io.BytesIO()
+        pdf.output(buf)
+        buf.seek(0)
+
+        fname = f"WorkLog_{datetime.date.today().strftime('%Y%m%d')}.pdf"
+        return send_file(buf, as_attachment=True, download_name=fname, mimetype="application/pdf")
+    except Exception as e:
+        app.logger.error(f"PDF export error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/db/size", methods=["GET"])
+def api_db_size():
+    """Return the Supabase database table size (estimated) or local SQLite size."""
+    if _supabase_configured():
+        try:
+            sb = _cloud_client()
+            # Query Supabase pg_total_relation_size for estimated table size
+            # Note: This requires a custom SQL query via Supabase RPC or direct postgres access
+            # For now, we'll get row count as a proxy for size
+            result = sb.table(TABLE).select("id", count="exact").execute()
+            row_count = result.count if hasattr(result, 'count') else 0
+            # Estimate: ~2KB per row average
+            estimated_bytes = row_count * 2048
+
+            if estimated_bytes < 1024:
+                size_str = f"~{estimated_bytes} B"
+            elif estimated_bytes < 1024 * 1024:
+                size_str = f"~{estimated_bytes / 1024:.1f} KB"
+            else:
+                size_str = f"~{estimated_bytes / (1024 * 1024):.2f} MB"
+            return jsonify({"size": size_str + " (Supabase)", "bytes": estimated_bytes, "rows": row_count})
+        except Exception as e:
+            # Fallback to local size if Supabase query fails
+            pass
+
+    # Local SQLite size
+    try:
+        size_bytes = os.path.getsize(SQLITE_PATH)
+        if size_bytes < 1024:
+            size_str = f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            size_str = f"{size_bytes / 1024:.1f} KB"
+        else:
+            size_str = f"{size_bytes / (1024 * 1024):.2f} MB"
+        return jsonify({"size": size_str + " (Local)", "bytes": size_bytes})
+    except Exception as e:
+        return jsonify({"size": "N/A", "bytes": 0, "error": str(e)})
+
+
+@app.route("/api/sync/check-schema", methods=["GET"])
+def api_sync_check_schema():
+    """Check if Supabase database has all required columns."""
+    if not _supabase_configured():
+        return jsonify({"configured": False, "message": "Supabase not configured"})
+
+    try:
+        sb = _cloud_client()
+        # Try to fetch one row to check available columns
+        result = sb.table(TABLE).select("*").limit(1).execute()
+
+        required_cols = {"sso_modeln", "ear", "bu", "application", "mchp_device", "project_schedule"}
+        if result.data:
+            existing_cols = set(result.data[0].keys())
+            missing = required_cols - existing_cols
+            if missing:
+                return jsonify({
+                    "ok": False,
+                    "missing_columns": list(missing),
+                    "message": f"Supabase schema needs update. Missing: {', '.join(missing)}"
+                })
+        return jsonify({"ok": True, "message": "Schema is up to date"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/image/resize", methods=["POST"])
+def api_image_resize():
+    """Accept base64 PNG, return resized thumbnail base64."""
+    if not HAS_PIL:
+        return jsonify({"error": "Pillow not installed"}), 500
+    b64 = request.json.get("data", "")
+    try:
+        raw  = base64.b64decode(b64)
+        img  = Image.open(io.BytesIO(raw))
+        img.thumbnail((800, 600), Image.LANCZOS)
+        out  = io.BytesIO()
+        img.save(out, format="PNG")
+        return jsonify({"data": base64.b64encode(out.getvalue()).decode()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORD BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
+def _hex_rgb(h):
+    h = h.lstrip("#")
+    return RGBColor(int(h[0:2],16), int(h[2:4],16), int(h[4:6],16))
+
+def _shade(cell, hx):
+    tcPr = cell._tc.get_or_add_tcPr()
+    shd  = OxmlElement("w:shd")
+    shd.set(qn("w:val"),"clear"); shd.set(qn("w:color"),"auto")
+    shd.set(qn("w:fill"), hx.lstrip("#")); tcPr.append(shd)
+
+def _cell(cell, text, bold=False, sz=10, bg=None, align="left"):
+    cell.text=""
+    p=cell.paragraphs[0]
+    p.alignment={"center":WD_ALIGN_PARAGRAPH.CENTER}.get(align,WD_ALIGN_PARAGRAPH.LEFT)
+    run=p.add_run(str(text or "")); run.font.size=Pt(sz); run.font.bold=bold
+    if bg: _shade(cell,bg)
+
+def _hdr_row(row, headers, bg="1E3A5F", sz=10):
+    for cell,h in zip(row.cells, headers):
+        _shade(cell,bg); p=cell.paragraphs[0]
+        p.alignment=WD_ALIGN_PARAGRAPH.CENTER
+        run=p.add_run(h); run.font.size=Pt(sz); run.font.bold=True
+        run.font.color.rgb=_hex_rgb("FFFFFF")
+
+def _set_widths(table, widths):
+    # Set column widths (applies to all rows including future ones)
+    for col, w in zip(table.columns, widths):
+        col.width = w
+    # Also set cell widths for existing rows
+    for row in table.rows:
+        for cell, w in zip(row.cells, widths):
+            cell.width = w
+
+def _week_date_range(year, week):
+    """Return (monday, friday) as date objects for ISO week."""
+    jan4      = datetime.date(year, 1, 4)
+    week1_mon = jan4 - datetime.timedelta(days=jan4.weekday())
+    monday    = week1_mon + datetime.timedelta(weeks=week - 1)
+    friday    = monday + datetime.timedelta(days=4)
+    return monday, friday
+
+
+def _wl_content_to_word(cell, content, bg_hex, doc):
+    """
+    Render a Worklog entry body into a Word table cell.
+    Handles: Markdown bold/italic/code, headings, bullets, indent, images.
+    """
+    IMG_PAT   = re.compile(r'\[IMG_B64:([A-Za-z0-9+/=]+)\]')
+    STAMP_PAT = re.compile(r'^── \d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})? ──$')
+    LIST_PAT  = re.compile(r'^([ \t]*)([-*+]|\d+\.)\s+(.*)')
+    HDR_PAT   = re.compile(r'^(#{1,3})\s+(.*)')
+
+    def add_inline(para, text, base_sz=10):
+        # Pattern: bold(**), italic(*), underline(__), strikethrough(~~), code(`)
+        for seg in re.split(r'(\*\*[^*]+\*\*|\*[^*]+\*|__[^_]+__|~~[^~]+~~|`[^`]+`)', text):
+            if not seg: continue
+            run = para.add_run()
+            run.font.size = Pt(base_sz)
+            if seg.startswith('**') and seg.endswith('**'):
+                run.text = seg[2:-2]; run.font.bold = True
+            elif seg.startswith('*') and seg.endswith('*'):
+                run.text = seg[1:-1]; run.font.italic = True
+            elif seg.startswith('__') and seg.endswith('__'):
+                run.text = seg[2:-2]; run.font.underline = True
+            elif seg.startswith('~~') and seg.endswith('~~'):
+                run.text = seg[2:-2]; run.font.strike = True
+            elif seg.startswith('`') and seg.endswith('`'):
+                run.text = seg[1:-1]; run.font.name = 'Courier New'; run.font.size = Pt(8)
+            else:
+                run.text = seg
+
+    cell.text = ''; _shade(cell, bg_hex)
+    first_para = True
+
+    def get_para():
+        nonlocal first_para
+        p = cell.paragraphs[0] if first_para else cell.add_paragraph()
+        first_para = False
+        _shade(cell, bg_hex)
+        return p
+
+    for line in content.split('\n'):
+        # Pure image line
+        img_m = IMG_PAT.fullmatch(line.strip())
+        if img_m:
+            try:
+                p = get_para()
+                p.add_run().add_picture(io.BytesIO(base64.b64decode(img_m.group(1))), width=Cm(8))
+            except Exception:
+                get_para().add_run('[image]').font.size = Pt(8)
+            continue
+
+        raw_indent = re.match(r'^([ \t]*)', line).group(1)
+        indent_sp  = raw_indent.replace('\t', '  ')
+        indent_lvl = len(indent_sp) // 2
+        indent_cm  = Cm(indent_lvl * 0.63)
+        stripped   = line.lstrip()
+
+        if STAMP_PAT.match(stripped):
+            p = get_para()
+            norm = re.sub(r'── (\d{4}-\d{2}-\d{2})(?:(?: \d{2}:\d{2}))? ──', r'── \1 ──', stripped)
+            run = p.add_run(norm); run.font.bold = True
+            run.font.size = Pt(8); run.font.color.rgb = _hex_rgb("2E75B6")
+            continue
+
+        hm = HDR_PAT.match(stripped)
+        if hm:
+            p = get_para(); p.paragraph_format.left_indent = indent_cm
+            run = p.add_run(hm.group(2)); run.font.bold = True
+            run.font.size = Pt(10 - hm.group(1).count('#')); run.font.color.rgb = _hex_rgb("1E3A5F")
+            continue
+
+        lm = LIST_PAT.match(line)
+        if lm:
+            bullet = lm.group(2); text = lm.group(3)
+            p = get_para()
+            p.paragraph_format.left_indent = Cm((indent_lvl + 1) * 0.63)
+            p.paragraph_format.first_line_indent = Cm(-0.5)
+            prefix = '•' if bullet in ('-', '*', '+') else bullet
+            p.add_run(f'{prefix}  ').font.size = Pt(10)
+            add_inline(p, text)
+            continue
+
+        segs = IMG_PAT.split(line)
+        if len(segs) > 1:
+            for si, seg in enumerate(segs):
+                if si % 2 == 0:
+                    if seg.strip():
+                        p = get_para(); p.paragraph_format.left_indent = indent_cm
+                        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                        add_inline(p, seg.strip())
+                else:
+                    try:
+                        p = get_para(); p.paragraph_format.left_indent = indent_cm
+                        p.add_run().add_picture(io.BytesIO(base64.b64decode(seg)), width=Cm(8))
+                    except Exception:
+                        get_para().add_run('[image]').font.size = Pt(8)
+            continue
+
+        if stripped:
+            p = get_para(); p.paragraph_format.left_indent = indent_cm
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            add_inline(p, stripped)
+
+
+def _build_word_doc(all_rows, out_buf, target_year=None, target_week=None):
+    """Build Word report: Task Summary + selected week Worklogs with Markdown/image rendering."""
+    # If no target week specified, use all records
+    if target_year and target_week:
+        wmon, wfri = _week_date_range(target_year, target_week)
+        week_str = (f"Week {target_week}  ·  "
+                    f"{wmon.strftime('%Y-%m-%d')} – {wfri.strftime('%Y-%m-%d')}")
+    else:
+        target_year = target_week = None
+        week_str = "All records"
+
+    doc = DocxDocument()
+    try:
+        cp = doc.core_properties
+        cp.author = "Work Log Journal"; cp.title = "Work Log Report"
+        cp.subject = "Work Log"; cp.keywords = "worklog"
+    except Exception:
+        pass
+    settings_part = doc.settings.element
+    for child in settings_part.findall(
+            '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}documentProtection'):
+        settings_part.remove(child)
+
+    sec = doc.sections[0]
+    sec.page_width  = Cm(29.7); sec.page_height = Cm(21.0)
+    sec.left_margin = sec.right_margin = Cm(1.8)
+    sec.top_margin  = sec.bottom_margin = Cm(1.5)
+
+    p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run("Work Log Report")
+    r.font.size = Pt(20); r.font.bold = True; r.font.color.rgb = _hex_rgb("1E3A5F")
+
+    p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run(f"{week_str}   |   "
+                  f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}   |   "
+                  f"{len(all_rows)} record(s)")
+    r.font.size = Pt(9); r.font.color.rgb = _hex_rgb("6B7280")
+    doc.add_paragraph()
+
+    report_rows = []
+    for row in all_rows:
+        wl = row.get("worklogs") or ""
+        if target_year and target_week:
+            entries = [(dt, c) for dt, c in parse_worklog_entries(wl)
+                       if dt.isocalendar()[:2] == (target_year, target_week)]
+        else:
+            entries = parse_worklog_entries(wl)
+            if not entries and wl.strip():
+                entries = [(datetime.datetime(1970, 1, 1), wl.strip())]
+        if entries or (row.get("task_summary") or "").strip():
+            report_rows.append({
+                "customer":     row.get("customer") or "",
+                "project_name": row.get("project_name") or "",
+                "task_summary": row.get("task_summary") or "",
+                "entries":      sorted(entries, key=lambda x: x[0]),
+            })
+    report_rows.sort(key=lambda r: (r["customer"].lower(), r["project_name"].lower()))
+
+    for idx, rec in enumerate(report_rows):
+        hdr = doc.add_table(2, 2); hdr.style = "Table Grid"
+        _set_widths(hdr, [Cm(3), Cm(22.9)])
+        # Customer row
+        _shade(hdr.rows[0].cells[0], "1E3A5F"); _shade(hdr.rows[0].cells[1], "1E3A5F")
+        lbl0 = hdr.rows[0].cells[0].paragraphs[0].add_run("Customer")
+        lbl0.font.size = Pt(10); lbl0.font.bold = True; lbl0.font.color.rgb = _hex_rgb("FFFFFF")
+        hdr.rows[0].cells[0].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        val0 = hdr.rows[0].cells[1].paragraphs[0].add_run(rec['customer'])
+        val0.font.size = Pt(10); val0.font.bold = True; val0.font.color.rgb = _hex_rgb("FFFFFF")
+        # Project row
+        _shade(hdr.rows[1].cells[0], "1E3A5F"); _shade(hdr.rows[1].cells[1], "1E3A5F")
+        lbl1 = hdr.rows[1].cells[0].paragraphs[0].add_run("Project")
+        lbl1.font.size = Pt(10); lbl1.font.bold = True; lbl1.font.color.rgb = _hex_rgb("FFFFFF")
+        hdr.rows[1].cells[0].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        val1 = hdr.rows[1].cells[1].paragraphs[0].add_run(rec['project_name'])
+        val1.font.size = Pt(10); val1.font.bold = True; val1.font.color.rgb = _hex_rgb("FFFFFF")
+
+        ts = (rec["task_summary"] or "").strip()
+        if ts:
+            ts_tbl = doc.add_table(1, 2); ts_tbl.style = "Table Grid"
+            _set_widths(ts_tbl, [Cm(3), Cm(22.9)])
+            _shade(ts_tbl.rows[0].cells[0], "344B6E")
+            lbl = ts_tbl.rows[0].cells[0].paragraphs[0].add_run("Task Summary")
+            lbl.font.size = Pt(10); lbl.font.bold = True; lbl.font.color.rgb = _hex_rgb("FFFFFF")
+            ts_tbl.rows[0].cells[0].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            _wl_content_to_word(ts_tbl.rows[0].cells[1], ts, "F0F4FB", doc)
+
+        if rec["entries"]:
+            et = doc.add_table(1, 2); et.style = "Table Grid"
+            _set_widths(et, [Cm(3), Cm(22.9)])
+            _hdr_row(et.rows[0], ["Date", "Worklog Entry"], bg="344B6E")
+            for i, (dt, content) in enumerate(rec["entries"]):
+                er = et.add_row()
+                bg = "EEF3FA" if i % 2 == 0 else "FFFFFF"
+                date_str = dt.strftime("%Y-%m-%d") if dt.year != 1970 else "—"
+                _cell(er.cells[0], date_str, sz=10, bg=bg, align="center")
+                _wl_content_to_word(er.cells[1], content, bg, doc)
+
+        if idx < len(report_rows) - 1:
+            doc.add_paragraph()
+
+    doc.add_paragraph()
+    fp = doc.add_paragraph(); fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    fp.add_run(
+        f"Work Log Report  –  {week_str}  –  {datetime.date.today().strftime('%Y-%m-%d')}"
+    ).font.size = Pt(8)
+
+    doc.save(out_buf)
+
+
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Work Log">
+<meta name="theme-color" content="#0f172a">
+<title>Work Log Journal</title>
+<link rel="manifest" href="/manifest.json">
+<style>
+  :root {
+    --bg:       #0f172a;
+    --bg2:      #1e293b;
+    --bg3:      #334155;
+    --border:   #475569;
+    --accent:   #38bdf8;
+    --accent2:  #0ea5e9;
+    --fg:       #f1f5f9;
+    --fg2:      #94a3b8;
+    --green:    #4ade80;
+    --yellow:   #fbbf24;
+    --red:      #f87171;
+    --grey:     #64748b;
+    --radius:   10px;
+    --font:     'DM Sans', system-ui, sans-serif;
+    --mono:     'JetBrains Mono', monospace;
+  }
+  [data-theme="light"] {
+    --bg:       #f8fafc;
+    --bg2:      #ffffff;
+    --bg3:      #e2e8f0;
+    --border:   #cbd5e1;
+    --accent:   #0ea5e9;
+    --accent2:  #0284c7;
+    --fg:       #0f172a;
+    --fg2:      #64748b;
+    --green:    #16a34a;
+    --yellow:   #d97706;
+    --red:      #dc2626;
+    --grey:     #9ca3af;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html,body { height:100%; font-family:var(--font); background:var(--bg); color:var(--fg); }
+  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+
+  /* ── Layout ── */
+  #app { display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+  #toolbar { display:flex; align-items:center; gap:8px; padding:10px 14px;
+             background:var(--bg2); border-bottom:1px solid var(--border);
+             flex-shrink:0; flex-wrap:wrap; }
+  #toolbar h1 { font-size:16px; font-weight:700; color:var(--accent);
+                letter-spacing:-.3px; margin-right:8px; white-space:nowrap; }
+  #db-badge { font-size:11px; color:var(--fg2); background:var(--bg3);
+              padding:2px 8px; border-radius:20px; white-space:nowrap; }
+  #version-badge { font-size:10px; color:var(--fg2); background:var(--bg3);
+              padding:2px 8px; border-radius:20px; white-space:nowrap; }
+  .spacer { flex:1; }
+  #filter-bar { display:flex; align-items:center; gap:8px; padding:8px 14px;
+                background:var(--bg); border-bottom:1px solid var(--border);
+                flex-shrink:0; flex-wrap:wrap; }
+  #filter-bar label { font-size:12px; color:var(--fg2); }
+  #main { flex:1; overflow:hidden; display:flex; flex-direction:column; }
+
+  /* ── Buttons ── */
+  .btn { display:inline-flex; align-items:center; gap:5px; padding:6px 12px;
+         border:none; border-radius:6px; cursor:pointer; font-size:12px;
+         font-weight:600; font-family:var(--font); transition:.15s; white-space:nowrap; }
+  .btn:active { opacity:.8; transform:scale(.97); }
+  .btn-accent  { background:var(--accent2); color:#fff; }
+  .btn-green   { background:#16a34a; color:#fff; }
+  .btn-red     { background:#dc2626; color:#fff; }
+  .btn-yellow  { background:#d97706; color:#fff; }
+  .btn-ghost   { background:var(--bg3); color:var(--fg); }
+  .btn-word    { background:#2563eb; color:#fff; }
+  .btn-sm      { padding:4px 9px; font-size:11px; }
+
+  /* ── Inputs ── */
+  input, select, textarea {
+    background:var(--bg2); color:var(--fg); border:1px solid var(--border);
+    border-radius:6px; padding:6px 10px; font-size:13px; font-family:var(--font);
+    width:100%; outline:none; transition:border .15s; }
+  input:focus, select:focus, textarea:focus { border-color:var(--accent); }
+  input[type="date"] { width:140px; }
+  select { width:auto; min-width:120px; }
+  textarea { resize:vertical; font-family:var(--mono); font-size:12px; }
+
+  /* ── Table ── */
+  #table-wrap { flex:1; overflow:auto; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  thead th { position:sticky; top:0; background:var(--bg2); padding:9px 10px;
+             text-align:left; font-size:11px; font-weight:600; color:var(--fg2);
+             border-bottom:1px solid var(--border); white-space:nowrap;
+             cursor:pointer; user-select:none; }
+  thead th:hover { color:var(--accent); }
+  tbody tr { border-bottom:1px solid var(--border); cursor:pointer; transition:.1s; }
+  tbody tr:hover { background:var(--bg3); }
+  tbody tr.selected { background:color-mix(in srgb, var(--accent) 15%, var(--bg)); }
+  tbody td { padding:7px 10px; vertical-align:top; max-width:260px;
+             overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  tbody td.wl-cell { white-space:normal; max-height:60px; overflow:hidden; max-width:400px; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:20px;
+           font-size:10px; font-weight:600; }
+  .badge-done   { background:color-mix(in srgb,var(--green) 20%,transparent);  color:var(--green); }
+  .badge-wip    { background:color-mix(in srgb,var(--yellow) 20%,transparent); color:var(--yellow); }
+  .badge-cancel { background:color-mix(in srgb,var(--red) 20%,transparent);    color:var(--red); }
+  .badge-other  { background:var(--bg3); color:var(--fg2); }
+  tr.archived td { opacity:.45; text-decoration:line-through; }
+
+  /* ── Modal ── */
+  #modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.65);
+                   z-index:100; align-items:center; justify-content:center; padding:12px; }
+  #modal-overlay.open { display:flex; }
+  #modal { background:var(--bg2); border-radius:14px; width:100%; max-width:860px;
+           max-height:95vh; display:flex; flex-direction:column;
+           border:1px solid var(--border); box-shadow:0 24px 80px rgba(0,0,0,.5); }
+  #modal-header { display:flex; align-items:center; justify-content:space-between;
+                  padding:14px 18px; border-bottom:1px solid var(--border); flex-shrink:0; }
+  #modal-header h2 { font-size:15px; font-weight:700; }
+  #modal-body { overflow-y:auto; padding:16px 18px; flex:1; }
+  #modal-footer { padding:12px 18px; border-top:1px solid var(--border);
+                  display:flex; justify-content:flex-end; gap:8px; flex-shrink:0; }
+  .form-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px 18px; }
+  .form-row { display:flex; flex-direction:column; gap:4px; }
+  .form-row label { font-size:11px; font-weight:600; color:var(--fg2); text-transform:uppercase; letter-spacing:.4px; }
+  .form-full { grid-column:1/-1; }
+  .char-hint { font-size:10px; color:var(--fg2); text-align:right; margin-top:2px; }
+
+  /* ── Worklogs editor ── */
+  #wl-tabs { display:flex; gap:4px; margin-bottom:6px; }
+  #wl-edit  { display:block; }
+  #wl-preview { display:none; background:var(--bg); border:1px solid var(--border);
+                border-radius:6px; padding:12px; min-height:200px; font-size:13px; line-height:1.7; }
+  #wl-preview h1 { font-size:1.4em; color:var(--accent); margin:.4em 0; }
+  #wl-preview h2 { font-size:1.2em; color:var(--accent); margin:.3em 0; }
+  #wl-preview h3 { font-size:1em;   color:var(--accent); margin:.2em 0; }
+  #wl-preview strong { font-weight:700; }
+  #wl-preview em { font-style:italic; }
+  #wl-preview code { background:var(--bg3); color:#f472b6; padding:1px 5px;
+                     border-radius:4px; font-family:var(--mono); font-size:.9em; }
+  #wl-preview .stamp { color:var(--accent); font-weight:700; font-size:.85em; }
+  #wl-preview ul, #wl-preview ol { padding-left:1.5em; margin:.2em 0; }
+  #wl-preview ul li { list-style-type: disc; }
+  #wl-preview ul ul li { list-style-type: circle; }
+  #wl-preview ul ul ul li { list-style-type: square; }
+  #wl-preview ol li { list-style-type: decimal; }
+  #wl-preview ol ol li { list-style-type: lower-alpha; }
+  #wl-preview ol ol ol li { list-style-type: lower-roman; }
+  #wl-preview li { margin:.1em 0; }
+  #wl-preview hr { border:none; border-top:1px solid var(--border); margin:.8em 0; }
+  #wl-preview img { max-width:100%; border-radius:6px; margin:.5em 0; }
+  .md-hint { font-size:10.5px; color:var(--fg2); background:var(--bg3);
+             padding:5px 10px; border-radius:6px; margin-top:5px; line-height:1.8; }
+  .paste-zone { border:2px dashed var(--border); border-radius:8px; padding:10px;
+                text-align:center; font-size:12px; color:var(--fg2); cursor:pointer;
+                margin-top:6px; transition:.15s; }
+  .paste-zone:hover, .paste-zone.drag-over { border-color:var(--accent); color:var(--accent); }
+  .img-thumb { max-width:160px; max-height:120px; border-radius:6px;
+               margin:4px; vertical-align:top; cursor:zoom-in;
+               transition:opacity .15s; }
+  .img-thumb:hover { opacity:.85; }
+
+  /* Lightbox */
+  #lightbox { display:none; position:fixed; inset:0; z-index:999;
+              background:rgba(0,0,0,.88); align-items:center;
+              justify-content:center; cursor:zoom-out; }
+  #lightbox.open { display:flex; }
+  #lightbox-img { max-width:90vw; max-height:90vh; border-radius:8px;
+                  object-fit:contain; cursor:default;
+                  box-shadow:0 8px 48px rgba(0,0,0,.7);
+                  /* drag-to-resize handle at bottom-right */
+                  resize:both; overflow:hidden; }
+  #lightbox-close { position:fixed; top:16px; right:20px; background:rgba(255,255,255,.15);
+                    border:none; color:#fff; font-size:22px; width:36px; height:36px;
+                    border-radius:50%; cursor:pointer; line-height:1;
+                    display:flex; align-items:center; justify-content:center; }
+  #lightbox-close:hover { background:rgba(255,255,255,.3); }
+
+  /* ── Import dialog ── */
+  #import-result { margin-top:10px; max-height:220px; overflow-y:auto; }
+  .ir-row { display:flex; gap:8px; padding:5px 8px; border-radius:6px;
+            font-size:12px; margin-bottom:3px; }
+  .ir-added   { background:color-mix(in srgb,var(--green) 12%,transparent); }
+  .ir-merged  { background:color-mix(in srgb,var(--yellow)12%,transparent); }
+  .ir-skipped { background:var(--bg3); }
+
+  /* ── Toast ── */
+  #toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%) translateY(40px);
+           background:var(--accent2); color:#fff; padding:9px 18px; border-radius:8px;
+           font-size:13px; font-weight:500; opacity:0; transition:.3s; pointer-events:none;
+           z-index:999; white-space:nowrap; }
+  #toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+
+  /* ── Theme toggle ── */
+  .theme-btn { background:none; border:none; cursor:pointer; font-size:16px;
+               padding:4px; border-radius:6px; transition:.15s; }
+  .theme-btn:hover { background:var(--bg3); }
+
+  /* ── Sync status bar ── */
+  #sync-bar { display:flex; align-items:center; gap:8px; padding:4px 14px;
+              background:var(--bg2); border-bottom:1px solid var(--border);
+              font-size:11px; color:var(--fg2); flex-shrink:0; flex-wrap:wrap; }
+  .sync-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+  .sync-online  { background:#22c55e; }
+  .sync-offline { background:#f59e0b; animation:pulse 2s infinite; }
+  .sync-error   { background:#ef4444; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  .conflict-badge { background:#ef4444; color:#fff; border-radius:10px;
+                    padding:1px 7px; font-size:10px; font-weight:700;
+                    cursor:pointer; margin-left:4px; }
+
+  /* ── Conflict modal ── */
+  #conflict-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.7);
+                      z-index:150; align-items:center; justify-content:center; padding:16px; }
+  #conflict-overlay.open { display:flex; }
+  #conflict-modal { background:var(--bg2); border-radius:14px; width:100%;
+                    max-width:820px; max-height:90vh; display:flex;
+                    flex-direction:column; border:1px solid var(--border); }
+  .conflict-card { border:1px solid var(--border); border-radius:8px;
+                   padding:12px; margin-bottom:10px; }
+  .conflict-col { flex:1; min-width:0; }
+  .conflict-col h4 { font-size:11px; font-weight:700; margin-bottom:6px;
+                     text-transform:uppercase; letter-spacing:.5px; }
+  .local-col  h4 { color:#f59e0b; }
+  .cloud-col  h4 { color:#38bdf8; }
+  .conf-field { font-size:11px; margin-bottom:3px; }
+  .conf-field strong { color:var(--fg2); min-width:90px; display:inline-block; }
+  .conf-diff  { background:color-mix(in srgb, #ef4444 12%, transparent);
+                border-radius:4px; padding:1px 4px; }
+
+  @media (max-width:600px) {
+    .form-grid { grid-template-columns:1fr; }
+    .form-full { grid-column:1; }
+    thead th:nth-child(n+7) { display:none; }
+    tbody td:nth-child(n+7) { display:none; }
+    #toolbar { gap:5px; }
+    .btn span { display:none; }
+  }
+</style>
+</head>
+<body data-theme="dark">
+<div id="app">
+
+  <!-- Toolbar -->
+  <div id="toolbar">
+    <h1>📋 Work Log</h1>
+    <span id="db-badge">loading…</span>
+    <button class="btn btn-green"  onclick="openNew()">➕ <span>New</span></button>
+    <button class="btn btn-yellow" onclick="openEdit()">✏️ <span>Edit</span></button>
+    <button class="btn btn-red"    onclick="deleteRecord()">🗑 <span>Delete</span></button>
+    <button class="btn btn-ghost"  onclick="openImport()">📥 <span>Import</span></button>
+    <button class="btn btn-word"   onclick="exportWord()">📄 <span>Word</span></button>
+    <button class="btn btn-ghost"  onclick="exportExcel()">📊 <span>Excel</span></button>
+    <button class="btn btn-ghost"  onclick="exportPdf()">📑 <span>PDF</span></button>
+    <div class="spacer"></div>
+    <span id="db-size-badge" style="font-size:10px;color:var(--fg2);margin-right:8px">DB: --</span>
+    <span id="version-badge">v0.9.5 by Keynes Hsu</span>
+    <button class="theme-btn" onclick="cycleTheme()" title="Toggle theme" id="theme-icon">🌙</button>
+    <button class="btn btn-ghost btn-sm" onclick="refreshList()">🔄</button>
+  </div>
+
+  <!-- Filter bar -->
+  <div id="filter-bar">
+    <label>Customer</label>
+    <input id="f-cust" style="width:130px" placeholder="filter…" oninput="refreshList()">
+    <label>Project</label>
+    <input id="f-proj" style="width:130px" placeholder="filter…" oninput="refreshList()">
+    <label>Status</label>
+    <select id="f-status" onchange="refreshList()"><option value="">All</option></select>
+    <label>Category</label>
+    <select id="f-cat" onchange="refreshList()"><option value="">All</option></select>
+    <label>Archive</label>
+    <select id="f-arch" onchange="refreshList()">
+      <option value="">All</option><option>No</option><option>Yes</option>
+    </select>
+    <button class="btn btn-ghost btn-sm" onclick="clearFilters()">Clear</button>
+  </div>
+
+  <!-- Sync status bar -->
+  <div id="sync-bar">
+    <span class="sync-dot sync-offline" id="sync-dot"></span>
+    <span id="sync-text">Checking…</span>
+    <span id="sync-pending" style="color:var(--yellow)"></span>
+    <span id="conflict-badge-wrap"></span>
+    <div class="spacer"></div>
+    <button class="btn btn-ghost btn-sm" onclick="syncNow()" id="sync-btn"
+            title="Sync now">⟳ Sync</button>
+  </div>
+
+  <!-- Table -->
+  <div id="main">
+    <div id="table-wrap">
+      <table id="records-table">
+        <thead>
+          <tr>
+            <th style="width:36px;text-align:center">
+              <input type="checkbox" id="chk-all" title="Select all"
+                     onchange="toggleAll(this.checked)" style="width:auto;cursor:pointer">
+            </th>
+            <th onclick="sortBy('week')">Week ⇅</th>
+            <th onclick="sortBy('category')">Category ⇅</th>
+            <th onclick="sortBy('customer')">Customer ⇅</th>
+            <th onclick="sortBy('project_name')">Project Name ⇅</th>
+            <th onclick="sortBy('status')">Status ⇅</th>
+            <th onclick="sortBy('task_summary')">Task Summary ⇅</th>
+            <th>Worklogs</th>
+            <th onclick="sortBy('project_schedule')">Milestone ⇅</th>
+            <th onclick="sortBy('application')">Application ⇅</th>
+            <th onclick="sortBy('sso_modeln')">SSO/ModelN# ⇅</th>
+            <th onclick="sortBy('mchp_device')">MCHP Device ⇅</th>
+            <th onclick="sortBy('ear')">EAR(K$) ⇅</th>
+            <th onclick="sortBy('bu')">BU ⇅</th>
+            <th onclick="sortBy('last_update')">Last Update ⇅</th>
+            <th onclick="sortBy('create_date')">Create Date ⇅</th>
+            <th onclick="sortBy('due_date')">Due Date ⇅</th>
+            <th onclick="sortBy('archive')">Archive ⇅</th>
+          </tr>
+        </thead>
+        <tbody id="records-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Record Modal -->
+<div id="modal-overlay">
+  <div id="modal">
+    <div id="modal-header">
+      <h2 id="modal-title">New Record</h2>
+      <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button>
+    </div>
+    <div id="modal-body">
+      <div class="form-grid">
+        <!-- Col 1 -->
+        <div class="form-row">
+          <label>Create Date</label>
+          <input type="date" id="f-create_date">
+        </div>
+        <div class="form-row">
+          <label>Customer <small style="color:var(--fg2)">(max 20)</small></label>
+          <input id="f-customer" maxlength="20" oninput="updateCharHint(this,'ch-cust')">
+          <div class="char-hint" id="ch-cust">0/20</div>
+        </div>
+        <div class="form-row">
+          <label>Due Date</label>
+          <input type="date" id="f-due_date">
+        </div>
+        <div class="form-row">
+          <label>Project Name <small style="color:var(--fg2)">(max 20)</small></label>
+          <input id="f-project_name" maxlength="20" oninput="updateCharHint(this,'ch-proj')">
+          <div class="char-hint" id="ch-proj">0/20</div>
+        </div>
+        <div class="form-row">
+          <label>SSO/ModelN# <small style="color:var(--fg2)">(max 10)</small></label>
+          <input id="f-sso_modeln" maxlength="10" oninput="updateCharHint(this,'ch-sso')">
+          <div class="char-hint" id="ch-sso">0/10</div>
+        </div>
+        <div class="form-row">
+          <label>EAR(K$) <small style="color:var(--fg2)">(max 20)</small></label>
+          <input id="f-ear" maxlength="20" oninput="updateCharHint(this,'ch-ear')">
+          <div class="char-hint" id="ch-ear">0/20</div>
+        </div>
+        <div class="form-row">
+          <label>Application <small style="color:var(--fg2)">(max 50)</small></label>
+          <input id="f-application" maxlength="50" oninput="updateCharHint(this,'ch-app')">
+          <div class="char-hint" id="ch-app">0/50</div>
+        </div>
+        <div class="form-row">
+          <label>Last Update</label>
+          <input type="date" id="f-last_update" oninput="autoWeek()">
+        </div>
+        <div class="form-row">
+          <label>MCHP Device</label>
+          <input id="f-mchp_device">
+        </div>
+        <div class="form-row">
+          <label>Week <small style="color:var(--fg2)">(auto)</small></label>
+          <input id="f-week" readonly style="background:var(--bg3);width:80px">
+        </div>
+        <div class="form-row">
+          <label>BU</label>
+          <select id="f-bu">
+            <option value="">--</option>
+            <option value="DCS">DCS</option>
+            <option value="NCS">NCS</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Category</label>
+          <select id="f-category"></select>
+        </div>
+        <div class="form-row">
+          <label>Status</label>
+          <select id="f-status-field"></select>
+        </div>
+        <div class="form-row" style="align-self:end">
+          <label><input type="checkbox" id="f-archive" style="width:auto;margin-right:6px">Archived</label>
+        </div>
+        <!-- Full width -->
+        <div class="form-row form-full">
+          <label>Task Summary</label>
+          <textarea id="f-task_summary" rows="3"></textarea>
+        </div>
+        <!-- Worklogs -->
+        <div class="form-row form-full">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+            <label style="margin:0">Worklogs</label>
+            <div id="wl-tabs">
+              <button class="btn btn-accent btn-sm" onclick="setWlTab('edit')">✏️ Edit</button>
+              <button class="btn btn-ghost btn-sm" onclick="setWlTab('preview')">👁 Preview</button>
+              <button class="btn btn-ghost btn-sm" onclick="insertStamp()">➕ Add Entry</button>
+            </div>
+          </div>
+          <div id="wl-edit">
+            <textarea id="f-worklogs" rows="12" placeholder="── 2025-03-01 09:00 ──&#10;Write your worklog here…&#10;Markdown supported."></textarea>
+            <div class="paste-zone" id="paste-zone"
+                 onclick="document.getElementById('img-upload').click()"
+                 ondragover="event.preventDefault();this.classList.add('drag-over')"
+                 ondragleave="this.classList.remove('drag-over')"
+                 ondrop="handleDrop(event)">
+              📎 Click or drag & drop to attach an image  •  or Ctrl+V to paste
+            </div>
+            <input type="file" id="img-upload" accept="image/*" style="display:none" onchange="handleFileSelect(event)">
+            <div id="img-preview-area"></div>
+          </div>
+          <div id="wl-preview" style="display:none"></div>
+          <div class="md-hint">
+            <strong>Markdown:</strong>
+            <code># H1</code> <code>## H2</code> <code>### H3</code> &nbsp;|&nbsp;
+            <code>**bold**</code> <code>*italic*</code> <code>__underline__</code> <code>~~strikethrough~~</code> <code>`code`</code> &nbsp;|&nbsp;
+            <code>- bullet</code> <code>1. list</code>
+            <code>&nbsp;&nbsp;- sub</code> <code>&nbsp;&nbsp;&nbsp;&nbsp;- sub-sub</code>
+            (indent 2 spaces = next level) &nbsp;|&nbsp;
+            <code>---</code> &nbsp;|&nbsp;
+            Ctrl+V / drag &amp; drop image
+          </div>
+        </div>
+        <!-- Milestone -->
+        <div class="form-row form-full">
+          <label>Milestone</label>
+          <textarea id="f-project_schedule" rows="6" placeholder="Project milestones and timeline...&#10;Markdown supported (no preview)."></textarea>
+          <div class="md-hint">
+            <strong>Markdown:</strong>
+            <code>**bold**</code> <code>*italic*</code> <code>__underline__</code> <code>~~strikethrough~~</code> <code>`code`</code> &nbsp;|&nbsp;
+            <code>- bullet</code> <code>1. list</code>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-accent" onclick="saveRecord()">💾 Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Import Modal -->
+<div id="import-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:110;align-items:center;justify-content:center;padding:12px;flex-direction:column">
+  <div style="background:var(--bg2);border-radius:14px;padding:20px;max-width:520px;width:100%;border:1px solid var(--border)">
+    <h2 style="margin-bottom:12px;font-size:15px">📥 Import & Merge</h2>
+    <p style="font-size:12px;color:var(--fg2);margin-bottom:10px">
+      Upload a JSON export from another Work Log instance. Records with matching
+      Customer + Project will have their Worklogs merged.
+    </p>
+    <input type="file" id="import-file" accept=".json" style="margin-bottom:10px">
+    <button class="btn btn-accent" onclick="doImport()">Import</button>
+    <button class="btn btn-ghost" onclick="closeImport()" style="margin-left:8px">Cancel</button>
+    <div id="import-result"></div>
+  </div>
+</div>
+
+<!-- Week Selection Modal for Word Export -->
+<div id="week-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:115;align-items:center;justify-content:center;padding:12px">
+  <div style="background:var(--bg2);border-radius:14px;padding:20px;max-width:400px;width:100%;border:1px solid var(--border)">
+    <h2 style="margin-bottom:12px;font-size:15px">📄 Export to Word</h2>
+    <p style="font-size:12px;color:var(--fg2);margin-bottom:12px">
+      Select which week's worklogs to include in the report:
+    </p>
+    <div style="margin-bottom:14px">
+      <select id="week-select" style="width:100%;padding:10px;font-size:13px">
+        <option value="all">All Worklogs</option>
+      </select>
+    </div>
+    <div id="week-info" style="font-size:11px;color:var(--fg2);margin-bottom:14px;padding:8px;background:var(--bg3);border-radius:6px;display:none">
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-ghost" onclick="closeWeekSelect()">Cancel</button>
+      <button class="btn btn-word" onclick="confirmWeekExport()">📄 Export</button>
+    </div>
+  </div>
+</div>
+
+<div id="stamp-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);
+     z-index:200;align-items:center;justify-content:center">
+  <div style="background:var(--bg2);border-radius:12px;padding:20px;
+              min-width:280px;border:1px solid var(--border);box-shadow:0 16px 48px rgba(0,0,0,.5)">
+    <h3 style="margin-bottom:14px;font-size:14px">📅  Insert Worklog Entry</h3>
+    <label style="font-size:11px;font-weight:600;color:var(--fg2);text-transform:uppercase;
+                  letter-spacing:.4px;display:block;margin-bottom:4px">Date</label>
+    <input type="date" id="stamp-date" style="width:100%;margin-bottom:14px">
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-ghost btn-sm" onclick="closeStamp()">Cancel</button>
+      <button class="btn btn-accent btn-sm" onclick="confirmStamp()">Insert</button>
+    </div>
+  </div>
+</div>
+
+<!-- Conflict Resolution Modal -->
+<div id="conflict-overlay">
+  <div id="conflict-modal">
+    <div style="display:flex;align-items:center;justify-content:space-between;
+                padding:14px 18px;border-bottom:1px solid var(--border);
+                background:#7c1d1d;border-radius:14px 14px 0 0">
+      <span style="font-weight:700;color:#fff;font-size:15px">
+        ⚠️  Sync Conflicts — Please Review
+      </span>
+      <button class="btn btn-ghost btn-sm" onclick="closeConflicts()"
+              style="color:#fff;background:rgba(255,255,255,.15)">✕</button>
+    </div>
+    <div style="padding:16px 18px;overflow-y:auto;flex:1">
+      <p style="font-size:12px;color:var(--fg2);margin-bottom:14px">
+        These records were edited locally while offline AND also updated in the cloud.
+        Choose which version to keep for each conflict.
+      </p>
+      <div id="conflict-list"></div>
+    </div>
+    <div style="padding:12px 18px;border-top:1px solid var(--border);
+                display:flex;justify-content:flex-end;gap:8px">
+      <button class="btn btn-ghost" onclick="closeConflicts()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="lightbox" onclick="closeLightbox(event)">
+  <button id="lightbox-close" onclick="closeLightbox()">✕</button>
+  <img id="lightbox-img" src="" alt="preview" onclick="event.stopPropagation()">
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let records = [], selectedId = null, editingId = null;
+let sortCol = 'id', sortAsc = false;
+let cfg = {};
+let themes = ['dark','light','system'];
+let themeIdx = 0;
+let pendingImages = []; // [{b64, filename}]
+let checkedIds = new Set(); // IDs selected for Word export
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+async function boot() {
+  cfg = await fetch('/api/config').then(r=>r.json());
+  document.getElementById('db-badge').textContent = 'DB: ' + cfg.db_type;
+  updateDbSize();
+  populateSelects();
+  const saved = localStorage.getItem('wl-theme') || 'dark';
+  themeIdx = themes.indexOf(saved); if (themeIdx<0) themeIdx=0;
+  applyTheme(themes[themeIdx]);
+
+  // Always show local data first (offline-first: instant load)
+  await refreshList();
+  document.addEventListener('paste', globalPaste);
+
+  // Check if we need an initial cloud pull
+  try {
+    const init = await fetch('/api/sync/init').then(r=>r.json());
+    if (init.online && !init.has_local_data) {
+      toast('☁️ First launch — loading data from cloud…');
+      const res  = await fetch('/api/sync/now', {method:'POST'});
+      const data = await res.json();
+      if (data.pulled > 0) {
+        await refreshList();
+        toast(`✅ Loaded ${data.pulled} record(s) from cloud`);
+      }
+    } else if (!init.has_local_data && !init.online) {
+      toast('📴 Offline — no local data yet. Connect to sync from cloud.');
+    }
+  } catch(e) {}
+}
+
+function populateSelects() {
+  ['f-status','f-status-field'].forEach(id=>{
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    sel.innerHTML = (id==='f-status'?'<option value="">All</option>':'') +
+      cfg.status_options.map(s=>`<option>${s}</option>`).join('');
+  });
+  ['f-cat','f-category'].forEach(id=>{
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    sel.innerHTML = (id==='f-cat'?'<option value="">All</option>':'') +
+      cfg.category_options.map(s=>`<option>${s}</option>`).join('');
+  });
+}
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+function cycleTheme() {
+  themeIdx = (themeIdx+1) % themes.length;
+  applyTheme(themes[themeIdx]);
+  localStorage.setItem('wl-theme', themes[themeIdx]);
+}
+function applyTheme(mode) {
+  let effective = mode;
+  if (mode==='system')
+    effective = window.matchMedia('(prefers-color-scheme:dark)').matches ? 'dark':'light';
+  document.body.dataset.theme = effective;
+  document.getElementById('theme-icon').textContent =
+    mode==='dark'?'🌙': mode==='light'?'☀️':'⚙️';
+  document.querySelector('meta[name=theme-color]').content =
+    effective==='dark'?'#0f172a':'#f8fafc';
+}
+
+// ── Data ──────────────────────────────────────────────────────────────────────
+async function refreshList() {
+  const params = new URLSearchParams({
+    customer:     document.getElementById('f-cust').value,
+    project_name: document.getElementById('f-proj').value,
+    status:       document.getElementById('f-status').value,
+    category:     document.getElementById('f-cat').value,
+    archive:      document.getElementById('f-arch').value,
+  });
+  records = await fetch('/api/records?'+params).then(r=>r.json());
+  sortRecords(); renderTable();
+}
+
+function clearFilters() {
+  ['f-cust','f-proj'].forEach(id=>document.getElementById(id).value='');
+  ['f-status','f-cat','f-arch'].forEach(id=>document.getElementById(id).value='');
+  refreshList();
+}
+
+function sortBy(col) {
+  if (sortCol===col) sortAsc=!sortAsc;
+  else { sortCol=col; sortAsc=true; }
+  sortRecords(); renderTable();
+}
+function sortRecords() {
+  records.sort((a,b)=>{
+    const va=String(a[sortCol]||''), vb=String(b[sortCol]||'');
+    return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+  });
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function statusBadge(s) {
+  const cls = s==='Task Done'?'done': s==='WIP'||s==='Production'?'wip':
+    s==='Cancelled'||s==='No More Activity'?'cancel':'other';
+  return `<span class="badge badge-${cls}">${s||'–'}</span>`;
+}
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function wlSnippet(wl) {
+  if (!wl) return '';
+  const clean = wl.replace(/\[IMG_B64:[^\]]+\]/g,'[img]').replace(/── .+? ──/g,'');
+  return esc(clean.trim().slice(0,80)) + (clean.length>80?'…':'');
+}
+
+function renderTable() {
+  const tbody = document.getElementById('records-body');
+  tbody.innerHTML = records.map(r => {
+    const archived = r.archive === 'Yes';
+    const checked  = checkedIds.has(r.id);
+    return `<tr class="${archived?'archived':''} ${r.id===selectedId?'selected':''}"
+               onclick="selectRow(${r.id})" ondblclick="openEdit()">
+      <td onclick="event.stopPropagation()" style="text-align:center">
+        <input type="checkbox" ${checked?'checked':''} style="width:auto;cursor:pointer"
+               onchange="toggleCheck(${r.id}, this.checked)">
+      </td>
+      <td>${r.week||''}</td>
+      <td>${esc(r.category||'')}</td>
+      <td>${esc(r.customer||'')}</td>
+      <td>${esc(r.project_name||'')}</td>
+      <td>${statusBadge(r.status)}</td>
+      <td>${esc((r.task_summary||'').slice(0,60))}</td>
+      <td class="wl-cell">${wlSnippet(r.worklogs)}</td>
+      <td>${esc((r.project_schedule||'').slice(0,60))}</td>
+      <td>${esc(r.application||'')}</td>
+      <td>${esc(r.sso_modeln||'')}</td>
+      <td>${esc(r.mchp_device||'')}</td>
+      <td>${esc(r.ear||'')}</td>
+      <td>${esc(r.bu||'')}</td>
+      <td>${r.last_update||''}</td>
+      <td>${r.create_date||''}</td>
+      <td>${r.due_date||''}</td>
+      <td>${r.archive||'No'}</td>
+    </tr>`;
+  }).join('');
+  // Sync select-all checkbox state
+  const allChk = document.getElementById('chk-all');
+  if (allChk) {
+    allChk.checked       = records.length > 0 && checkedIds.size === records.length;
+    allChk.indeterminate = checkedIds.size > 0 && checkedIds.size < records.length;
+  }
+}
+
+function selectRow(id) { selectedId = id; renderTable(); }
+
+function toggleCheck(id, checked) {
+  if (checked) checkedIds.add(id); else checkedIds.delete(id);
+  renderTable();
+}
+
+function toggleAll(checked) {
+  if (checked) records.forEach(r => checkedIds.add(r.id));
+  else checkedIds.clear();
+  renderTable();
+}
+
+// ── Modal helpers ─────────────────────────────────────────────────────────────
+function openModal(title) {
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-overlay').classList.add('open');
+}
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('open');
+  editingId=null; pendingImages=[];
+  document.getElementById('img-preview-area').innerHTML='';
+}
+
+function dateFmt(s) {
+  // Convert mm-dd-yyyy → yyyy-mm-dd for <input type=date>
+  if (!s) return '';
+  const m=s.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  return m ? `${m[3]}-${m[1]}-${m[2]}` : s;
+}
+function dateOut(s) {
+  // Convert yyyy-mm-dd → mm-dd-yyyy for API
+  if (!s) return '';
+  const m=s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return m ? `${m[2]}-${m[3]}-${m[1]}` : s;
+}
+
+function autoWeek() {
+  const d = document.getElementById('f-last_update').value;
+  if (!d) return;
+  const dt = new Date(d);
+  const jan1 = new Date(dt.getFullYear(),0,1);
+  const week = Math.ceil(((dt-jan1)/86400000 + jan1.getDay()+1)/7);
+  document.getElementById('f-week').value = week;
+}
+
+function fillForm(rec) {
+  const fd = (field, val) => { const el=document.getElementById('f-'+field); if(el) el.value=val||''; };
+  fd('create_date', dateFmt(rec.create_date));
+  fd('due_date',    dateFmt(rec.due_date));
+  fd('last_update', dateFmt(rec.last_update));
+  fd('customer',    rec.customer);
+  fd('project_name',rec.project_name);
+  fd('sso_modeln',  rec.sso_modeln);
+  fd('ear',         rec.ear);
+  fd('application', rec.application);
+  fd('bu',          rec.bu);
+  fd('mchp_device', rec.mchp_device);
+  fd('week',        rec.week);
+  fd('category',    rec.category||'General');
+  fd('status-field',rec.status||'Not Started');
+  fd('task_summary',rec.task_summary);
+  fd('project_schedule',rec.project_schedule);
+  document.getElementById('f-archive').checked = rec.archive==='Yes';
+  // Character hints
+  updateCharHint(document.getElementById('f-customer'),'ch-cust');
+  updateCharHint(document.getElementById('f-project_name'),'ch-proj');
+  updateCharHint(document.getElementById('f-sso_modeln'),'ch-sso');
+  updateCharHint(document.getElementById('f-ear'),'ch-ear');
+  updateCharHint(document.getElementById('f-application'),'ch-app');
+  // Restore embedded images as UID placeholders + thumbnails with delete buttons
+  const area = document.getElementById('img-preview-area');
+  area.innerHTML = '';
+  pendingImages = [];
+  const imgPat = /\[IMG_B64:([A-Za-z0-9+/=]+)\]/g;
+  let wlDisplay = rec.worklogs || '';
+  let m;
+  while ((m = imgPat.exec(rec.worklogs || '')) !== null) {
+    const uid = 'img_' + Math.random().toString(36).slice(2, 10);
+    pendingImages.push({uid, b64: m[1]});
+    wlDisplay = wlDisplay.replace(m[0], `[📷 ${uid}]`);
+    _addImageThumb(uid, m[1]);
+  }
+  document.getElementById('f-worklogs').value = wlDisplay;
+}
+
+function formData() {
+  const gv = id => document.getElementById(id)?.value||'';
+  // Replace [📷 uid] placeholders with IMG_B64 tokens for DB storage
+  let wl = gv('f-worklogs');
+  pendingImages.forEach(img => {
+    wl = wl.split(`[📷 ${img.uid}]`).join(`[IMG_B64:${img.b64}]`);
+  });
+  return {
+    create_date:  dateOut(gv('f-create_date')),
+    due_date:     dateOut(gv('f-due_date')),
+    last_update:  dateOut(gv('f-last_update')) || today(),
+    week:         gv('f-week'),
+    customer:     gv('f-customer').slice(0,20),
+    project_name: gv('f-project_name').slice(0,20),
+    sso_modeln:   gv('f-sso_modeln').slice(0,10),
+    ear:          gv('f-ear').slice(0,20),
+    application:  gv('f-application').slice(0,50),
+    bu:           gv('f-bu'),
+    mchp_device:  gv('f-mchp_device'),
+    category:     gv('f-category'),
+    status:       gv('f-status-field'),
+    task_summary: gv('f-task_summary'),
+    project_schedule: gv('f-project_schedule'),
+    worklogs:     wl,
+    archive:      document.getElementById('f-archive').checked ? 'Yes':'No',
+  };
+}
+
+function today() {
+  const d=new Date(), p=n=>String(n).padStart(2,'0');
+  return `${p(d.getMonth()+1)}-${p(d.getDate())}-${d.getFullYear()}`;
+}
+
+function openNew() {
+  editingId=null; pendingImages=[];
+  document.getElementById('img-preview-area').innerHTML='';
+  fillForm({create_date:today(), last_update:today(), status:'Not Started', category:'General', archive:'No'});
+  autoWeek();
+  setWlTab('edit');
+  openModal('New Record');
+}
+function openEdit() {
+  if (!selectedId) { toast('Select a record first'); return; }
+  const rec = records.find(r=>r.id===selectedId);
+  if (!rec) return;
+  editingId = selectedId;
+  fillForm(rec);
+  setWlTab('edit');
+  openModal('Edit Record');
+}
+
+async function saveRecord() {
+  const data = formData();
+  const method = editingId ? 'PUT' : 'POST';
+  const url    = editingId ? `/api/records/${editingId}` : '/api/records';
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(data)
+    });
+    const json = await res.json();
+    if (!res.ok) {
+      toast('❌ Save failed: ' + (json.error || res.status));
+      console.error('Save error:', json);
+      return;
+    }
+    closeModal();
+    await refreshList();
+    toast(editingId ? '✅ Record updated' : '✅ Record added');
+  } catch (e) {
+    toast('❌ Network error: ' + e.message);
+    console.error(e);
+  }
+}
+
+async function deleteRecord() {
+  if (!selectedId) { toast('Select a record first'); return; }
+  if (!confirm('Delete this record?')) return;
+  await fetch(`/api/records/${selectedId}`, {method:'DELETE'});
+  selectedId=null; refreshList(); toast('Deleted');
+}
+
+// ── Worklogs ──────────────────────────────────────────────────────────────────
+function setWlTab(tab) {
+  document.getElementById('wl-edit').style.display    = tab==='edit'?'block':'none';
+  document.getElementById('wl-preview').style.display = tab==='preview'?'block':'none';
+  if (tab==='preview') renderPreview();
+}
+function renderPreview() {
+  const md = document.getElementById('f-worklogs').value;
+  document.getElementById('wl-preview').innerHTML = parseMarkdown(md);
+}
+
+function insertStamp() {
+  // Show date-picker modal with today pre-filled
+  const today = new Date();
+  const pad = n => String(n).padStart(2,'0');
+  document.getElementById('stamp-date').value =
+    `${today.getFullYear()}-${pad(today.getMonth()+1)}-${pad(today.getDate())}`;
+  document.getElementById('stamp-overlay').style.display = 'flex';
+}
+function closeStamp() {
+  document.getElementById('stamp-overlay').style.display = 'none';
+}
+function confirmStamp() {
+  const dateVal = document.getElementById('stamp-date').value;
+  if (!dateVal) { closeStamp(); return; }
+  const d   = new Date(dateVal + 'T00:00:00');
+  const pad = n => String(n).padStart(2,'0');
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+  const ta = document.getElementById('f-worklogs');
+  _insertAtCursor(ta, `\n── ${stamp} ──\n`);
+  closeStamp();
+  sortWorklogs();
+  setWlTab('edit');
+  ta.focus();
+}
+
+function sortWorklogs() {
+  /** Parse all stamped entries, sort by date, reassemble. Pre-stamp text preserved. */
+  const ta   = document.getElementById('f-worklogs');
+  const text = ta.value;
+  // Match both date-only and legacy date+time stamps
+  const splitPat = /(── \d{4}-\d{2}-\d{2}(?:(?: \d{2}:\d{2}))? ──)/;
+  const keyPat   = /── (\d{4}-\d{2}-\d{2})(?:(?: \d{2}:\d{2}))? ──/;
+  const parts  = text.split(splitPat);
+  const pre    = parts[0];
+  const entries = [];
+  for (let i = 1; i + 1 < parts.length; i += 2) {
+    const stamp   = parts[i];
+    const body    = parts[i+1] || '';
+    const m       = stamp.match(keyPat);
+    const dateKey = m ? m[1] : '';
+    // Normalise stamp to date-only format
+    const normStamp = dateKey ? `── ${dateKey} ──` : stamp;
+    entries.push({ stamp: normStamp, body, dateKey });
+  }
+  if (entries.length < 2) return;
+  entries.sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  ta.value = pre + entries.map(e => e.stamp + e.body).join('');
+}
+
+function parseMarkdown(md) {
+  if (!md) return '';
+
+  // ── Pre-process: convert [📷 uid] and [IMG_B64:...] to sentinel tokens ──
+  // We do this before splitting into lines so multi-char tokens don't confuse things.
+  const IMG_TOK = [];
+  md = md.replace(/\[📷 (img_[a-z0-9]+)\]/g, (_, uid) => {
+    const obj = pendingImages.find(p => p.uid === uid);
+    IMG_TOK.push(obj ? `<img src="data:image/png;base64,${obj.b64}" class="img-thumb">` : '<span style="color:var(--fg2)">[📷]</span>');
+    return `\x00IMG${IMG_TOK.length - 1}\x00`;
+  });
+  md = md.replace(/\[IMG_B64:([A-Za-z0-9+/=]+)\]/g, (_, b64) => {
+    IMG_TOK.push(`<img src="data:image/png;base64,${b64}" class="img-thumb">`);
+    return `\x00IMG${IMG_TOK.length - 1}\x00`;
+  });
+
+  const lines = md.split('\n');
+
+  // ── Build token list ───────────────────────────────────────────────────────
+  // Each token: {type, indent, content, ordered}
+  const tokens = [];
+  for (const raw of lines) {
+    const line = raw.replace(/\[IMG:[a-f0-9]{12}\]/g, '');
+
+    if (/^── \d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})? ──$/.test(line.trim())) {
+      const norm = line.trim().replace(/── (\d{4}-\d{2}-\d{2})(?:(?: \d{2}:\d{2}))? ──/, '── $1 ──');
+      tokens.push({type:'stamp', content: norm}); continue;
+    }
+    // Measure indent for every line (used by lists AND images)
+    const indentMatch = line.match(/^([ \t]*)/);
+    const rawIndent   = indentMatch ? indentMatch[1] : '';
+    const indent      = rawIndent.replace(/\t/g, '  ').length;
+    const rest        = line.slice(rawIndent.length);
+
+    if (/^\x00IMG\d+\x00$/.test(rest.trim())) {
+      tokens.push({type:'img', indent, content: rest.trim()}); continue;
+    }
+    if (/^-{3,}$/.test(rest.trim())) {
+      tokens.push({type:'hr'}); continue;
+    }
+    const hm = rest.match(/^(#{1,3})\s+(.*)/);
+    if (hm) { tokens.push({type:'h', level: hm[1].length, content: hm[2]}); continue; }
+
+    const bm = rest.match(/^[-*+]\s+(.*)/);
+    if (bm) { tokens.push({type:'li', indent, ordered:false, content: bm[1]}); continue; }
+    const nm = rest.match(/^(\d+)\.\s+(.*)/);
+    if (nm) { tokens.push({type:'li', indent, ordered:true,  content: nm[2]}); continue; }
+
+    tokens.push({type:'p', content: line});
+  }
+
+  // ── Render tokens → HTML ───────────────────────────────────────────────────
+  // Normalise raw indent → level (0-based): every 2 spaces or 1 tab = +1 level.
+  // Stack entries: { tag:'ul'|'ol', level:number }
+  let html  = '';
+  const stack = [];
+
+  function stackTop()  { return stack[stack.length - 1]; }
+  function closeAll()  { while (stack.length) html += `</${stack.pop().tag}>`; }
+  function closeTo(targetLevel) {
+    while (stack.length && stackTop().level > targetLevel)
+      html += `</${stack.pop().tag}>`;
+  }
+
+  for (const tok of tokens) {
+    if (tok.type === 'li') {
+      const tag   = tok.ordered ? 'ol' : 'ul';
+      const level = Math.floor(tok.indent / 2);   // 0=root, 1=1 indent, 2=2 indents …
+      const top   = stackTop();
+
+      if (!top) {
+        // No list open yet — start one
+        html += `<${tag}>`;
+        stack.push({tag, level});
+      } else if (level > top.level) {
+        // Going deeper — always open a new child list
+        html += `<${tag}>`;
+        stack.push({tag, level});
+      } else if (level < top.level) {
+        // Going shallower — pop until we match the target level
+        closeTo(level);
+        const cur = stackTop();
+        if (!cur || cur.level !== level) {
+          // No existing list at this level; open a fresh one
+          html += `<${tag}>`;
+          stack.push({tag, level});
+        } else if (cur.tag !== tag) {
+          // Same level but different list type (ul↔ol) — swap
+          html += `</${stack.pop().tag}><${tag}>`;
+          stack.push({tag, level});
+        }
+      } else {
+        // Same level — swap tag if type changed (ul↔ol)
+        if (top.tag !== tag) {
+          html += `</${stack.pop().tag}><${tag}>`;
+          stack.push({tag, level});
+        }
+      }
+      html += `<li>${inlineM(tok.content)}</li>`;
+    } else {
+      closeAll();
+      if      (tok.type === 'stamp') html += `<div class="stamp">${esc(tok.content)}</div>`;
+      else if (tok.type === 'img') {
+        const marginEm = (tok.indent || 0) * 0.6;   // ~0.6em per space, same visual as list indent
+        const style    = marginEm > 0 ? ` style="margin-left:${marginEm.toFixed(1)}em"` : '';
+        const imgHtml  = tok.content.replace(/\x00IMG(\d+)\x00/, (_, i) => IMG_TOK[+i] || '');
+        html += `<div${style}>${imgHtml}</div>`;
+      }
+      else if (tok.type === 'hr')    html += '<hr>';
+      else if (tok.type === 'h')     html += `<h${tok.level}>${inlineM(tok.content)}</h${tok.level}>`;
+      else {
+        const resolved = tok.content.replace(/\x00IMG(\d+)\x00/g, (_, i) => IMG_TOK[+i] || '');
+        const trimmed  = resolved.trim();
+        if (trimmed) html += `<p>${inlineM(trimmed)}</p>`;
+      }
+    }
+  }
+  closeAll();
+  return html;
+}
+function inlineM(s) {
+  return esc(s)
+    .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g,'<em>$1</em>')
+    .replace(/__(.+?)__/g,'<u>$1</u>')
+    .replace(/~~(.+?)~~/g,'<del>$1</del>')
+    .replace(/`(.+?)`/g,'<code>$1</code>');
+}
+
+// ── Image handling ────────────────────────────────────────────────────────────
+function globalPaste(e) {
+  const modal = document.getElementById('modal-overlay');
+  if (!modal.classList.contains('open')) return;
+  const items = e.clipboardData?.items||[];
+  for (const item of items) {
+    if (item.type.startsWith('image/')) {
+      e.preventDefault();
+      const blob = item.getAsFile();
+      readAndEmbedImage(blob); return;
+    }
+  }
+}
+function handleDrop(e) {
+  e.preventDefault(); e.target.classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file && file.type.startsWith('image/')) readAndEmbedImage(file);
+}
+function handleFileSelect(e) {
+  const file = e.target.files[0];
+  if (file) readAndEmbedImage(file);
+  e.target.value='';
+}
+function readAndEmbedImage(blob) {
+  const reader = new FileReader();
+  reader.onload = async ev => {
+    let b64 = ev.target.result.split(',')[1];
+    try {
+      const res = await fetch('/api/image/resize', {method:'POST',
+        headers:{'Content-Type':'application/json'}, body:JSON.stringify({data:b64})});
+      if (res.ok) b64 = (await res.json()).data;
+    } catch(e) {}
+    const uid = 'img_' + Math.random().toString(36).slice(2, 10);
+    pendingImages.push({uid, b64});
+    _addImageThumb(uid, b64);
+    _insertAtCursor(document.getElementById('f-worklogs'), `\n[📷 ${uid}]\n`);
+    toast('📷 Image attached');
+  };
+  reader.readAsDataURL(blob);
+}
+
+function _insertAtCursor(ta, text) {
+  const start = ta.selectionStart;
+  const end   = ta.selectionEnd;
+  const before = ta.value.slice(0, start);
+  const after  = ta.value.slice(end);
+  ta.value = before + text + after;
+  // Move cursor to after the inserted text
+  const newPos = start + text.length;
+  ta.selectionStart = ta.selectionEnd = newPos;
+  ta.focus();
+}
+
+function _addImageThumb(uid, b64) {
+  const area = document.getElementById('img-preview-area');
+  const thumb = document.createElement('div');
+  thumb.id = 'thumb_' + uid;
+  thumb.style.cssText = 'display:inline-flex;align-items:center;gap:6px;' +
+    'background:var(--bg3);border-radius:6px;padding:4px 8px;margin:3px;font-size:11px;' +
+    'position:relative;';
+  const img = document.createElement('img');
+  img.style.cssText = 'width:48px;height:36px;object-fit:cover;border-radius:4px;cursor:default;';
+  img.src = 'data:image/png;base64,' + b64;
+  const lbl = document.createElement('span');
+  lbl.style.color = 'var(--fg2)'; lbl.textContent = '📷';
+  const del = document.createElement('button');
+  del.textContent = '✕';
+  del.title = 'Remove image';
+  del.style.cssText = 'border:none;background:var(--red);color:#fff;border-radius:4px;' +
+    'width:18px;height:18px;cursor:pointer;font-size:10px;padding:0;line-height:1;' +
+    'flex-shrink:0;';
+  del.onclick = () => removeImage(uid);
+  thumb.appendChild(img); thumb.appendChild(lbl); thumb.appendChild(del);
+  area.appendChild(thumb);
+}
+
+function removeImage(uid) {
+  // Remove from pendingImages
+  pendingImages = pendingImages.filter(p => p.uid !== uid);
+  // Remove thumbnail
+  const t = document.getElementById('thumb_' + uid);
+  if (t) t.remove();
+  // Remove placeholder from textarea
+  const ta = document.getElementById('f-worklogs');
+  ta.value = ta.value.replace(new RegExp(`\\n?\\[📷 ${uid}\\]\\n?`, 'g'), '\n').trim();
+  toast('Image removed');
+}
+
+// ── Import ────────────────────────────────────────────────────────────────────
+function openImport()  { document.getElementById('import-overlay').style.display='flex'; }
+function closeImport() { document.getElementById('import-overlay').style.display='none'; document.getElementById('import-result').innerHTML=''; }
+
+async function doImport() {
+  const file = document.getElementById('import-file').files[0];
+  if (!file) { toast('Choose a JSON file first'); return; }
+  const text = await file.text();
+  let data;
+  try { data=JSON.parse(text); } catch(e) { toast('Invalid JSON'); return; }
+  const res = await fetch('/api/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  const result = await res.json();
+  const div = document.getElementById('import-result');
+  div.innerHTML = `<div style="margin:8px 0;font-size:12px">
+    ➕ Added: <strong>${result.added}</strong> &nbsp;
+    🔀 Merged: <strong>${result.merged}</strong> &nbsp;
+    ⏭ Skipped: <strong>${result.skipped}</strong>
+  </div>` + result.results.map(r=>`
+    <div class="ir-row ir-${r.status}">
+      <span>${r.status==='added'?'➕':r.status==='merged'?'🔀':'⏭'}</span>
+      <span>${esc(r.customer)}</span>
+      <span style="color:var(--fg2)">${esc(r.project)}</span>
+    </div>`).join('');
+  refreshList();
+}
+
+// ── Word export ───────────────────────────────────────────────────────────────
+let exportIds = [];
+
+async function exportWord() {
+  const ids = [...checkedIds];
+  if (ids.length === 0) { toast('☑ Check at least one record first'); return; }
+  exportIds = ids;
+  await openWeekSelect();
+}
+
+async function exportExcel() {
+  const ids = [...checkedIds];
+  if (ids.length === 0) { toast('☑ Check at least one record first'); return; }
+  try {
+    const res = await fetch('/api/export/excel', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ ids })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `WorkLog_${new Date().toISOString().slice(0,10)}.xlsx`;
+    a.click();
+    toast('📊 Excel exported successfully');
+  } catch (e) {
+    toast('❌ Excel export failed: ' + e.message);
+  }
+}
+
+async function exportPdf() {
+  const ids = [...checkedIds];
+  if (ids.length === 0) { toast('☑ Check at least one record first'); return; }
+  try {
+    const res = await fetch('/api/export/pdf', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ ids })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `WorkLog_${new Date().toISOString().slice(0,10)}.pdf`;
+    a.click();
+    toast('📑 PDF exported successfully');
+  } catch (e) {
+    toast('❌ PDF export failed: ' + e.message);
+  }
+}
+
+async function openWeekSelect() {
+  const sel = document.getElementById('week-select');
+  const info = document.getElementById('week-info');
+  sel.innerHTML = '<option value="loading">Loading weeks...</option>';
+  info.style.display = 'none';
+  document.getElementById('week-overlay').style.display = 'flex';
+
+  try {
+    const res = await fetch('/api/export/weeks', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ ids: exportIds })
+    });
+    const weeks = await res.json();
+
+    sel.innerHTML = '<option value="all">📋 All Worklogs (no filter)</option>';
+    weeks.forEach(w => {
+      const opt = document.createElement('option');
+      opt.value = w.value;
+      opt.textContent = `${w.label}  (${w.range})`;
+      sel.appendChild(opt);
+    });
+
+    if (weeks.length === 0) {
+      info.textContent = 'No dated worklogs found in selected records.';
+      info.style.display = 'block';
+    }
+  } catch (e) {
+    sel.innerHTML = '<option value="all">All Worklogs</option>';
+    info.textContent = 'Could not load weeks: ' + e.message;
+    info.style.display = 'block';
+  }
+}
+
+function closeWeekSelect() {
+  document.getElementById('week-overlay').style.display = 'none';
+  exportIds = [];
+}
+
+async function confirmWeekExport() {
+  const week = document.getElementById('week-select').value;
+  if (week === 'loading') return;
+
+  closeWeekSelect();
+  toast(`Generating report for ${exportIds.length} record(s)…`);
+
+  try {
+    const res = await fetch('/api/export/word', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ ids: exportIds, week })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({error: res.statusText}));
+      toast('❌ Export failed: ' + (err.error || res.status));
+      return;
+    }
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url;
+    a.download = `WorkLog_${new Date().toISOString().slice(0,10)}.docx`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast('✅ Report downloaded');
+  } catch (e) {
+    toast('❌ ' + e.message);
+  }
+}
+
+// ── Misc ──────────────────────────────────────────────────────────────────────
+function updateCharHint(el, hintId) {
+  const h=document.getElementById(hintId); if(!h)return;
+  h.textContent=`${el.value.length}/${el.maxLength}`;
+  h.style.color=el.value.length>=el.maxLength?'var(--red)':'var(--fg2)';
+}
+let toastTimer;
+function toast(msg) {
+  const el=document.getElementById('toast'); el.textContent=msg;
+  el.classList.add('show'); clearTimeout(toastTimer);
+  toastTimer=setTimeout(()=>el.classList.remove('show'),2600);
+}
+
+// ── Sync & Offline ────────────────────────────────────────────────────────────
+let _syncInterval = null;
+
+async function updateDbSize() {
+  try {
+    const res = await fetch('/api/db/size');
+    const data = await res.json();
+    document.getElementById('db-size-badge').textContent = `DB: ${data.size}`;
+  } catch (e) {
+    document.getElementById('db-size-badge').textContent = 'DB: --';
+  }
+}
+
+function startSyncPoller() {
+  updateSyncStatus();
+  _syncInterval = setInterval(updateSyncStatus, 15000);
+}
+
+async function updateSyncStatus() {
+  updateDbSize();
+  try {
+    const res  = await fetch('/api/sync/status');
+    const data = await res.json();
+    const dot  = document.getElementById('sync-dot');
+    const txt  = document.getElementById('sync-text');
+    const pend = document.getElementById('sync-pending');
+    const badgeWrap = document.getElementById('conflict-badge-wrap');
+
+    if (data.online) {
+      dot.className = 'sync-dot sync-online';
+      txt.textContent = data.last_sync
+        ? `Online — last sync ${data.last_sync}` : 'Online — syncing…';
+    } else {
+      dot.className = 'sync-dot sync-offline';
+      txt.textContent = 'Offline — changes saved locally';
+    }
+    pend.textContent = data.pending > 0
+      ? `  ${data.pending} pending upload(s)` : '';
+    if (data.conflicts > 0) {
+      badgeWrap.innerHTML =
+        `<span class="conflict-badge" onclick="openConflicts()">
+          ⚠ ${data.conflicts} conflict${data.conflicts>1?'s':''}
+        </span>`;
+    } else {
+      badgeWrap.innerHTML = '';
+    }
+  } catch(e) {
+    const dot = document.getElementById('sync-dot');
+    if (dot) dot.className = 'sync-dot sync-error';
+  }
+}
+
+async function syncNow() {
+  const btn = document.getElementById('sync-btn');
+  btn.textContent = '⟳ Syncing…'; btn.disabled = true;
+  try {
+    // First test connectivity and show diagnostics if not configured
+    const testRes  = await fetch('/api/sync/test');
+    const testData = await testRes.json();
+
+    if (!testData.has_supabase_lib) {
+      toast('❌ supabase library missing — run: pip install supabase'); return;
+    }
+    if (!testData.configured) {
+      toast('⚙️ Supabase not configured — set URL and Key in .env'); return;
+    }
+    if (!testData.online) {
+      toast(`📴 Cannot reach ${testData.url} — check credentials or WiFi`); return;
+    }
+
+    // Check if Supabase schema is up to date
+    const schemaRes = await fetch('/api/sync/check-schema');
+    const schemaData = await schemaRes.json();
+    if (schemaData.ok === false && schemaData.missing_columns) {
+      if (confirm(`⚠️ Supabase database needs update!\n\nMissing columns: ${schemaData.missing_columns.join(', ')}\n\nPlease run the migration SQL in SUPABASE_MIGRATION.md\n\nContinue sync anyway? (May cause errors)`)) {
+        // User chose to continue despite schema mismatch
+      } else {
+        return; // User cancelled
+      }
+    }
+
+    const res  = await fetch('/api/sync/now', {method:'POST'});
+    const data = await res.json();
+    if (data.ok === false) {
+      toast('📴 Offline — changes queued');
+    } else {
+      const msg = [];
+      if (data.pushed)    msg.push(`${data.pushed} uploaded`);
+      if (data.pulled)    msg.push(`${data.pulled} downloaded`);
+      if (data.conflicts) msg.push(`⚠ ${data.conflicts} conflict(s)`);
+      if (data.errors && data.errors.length) {
+        console.error('Sync errors:', data.errors);
+        // Check if errors are due to missing Supabase columns
+        const schemaError = data.errors.some(e =>
+          e.includes('column') || e.includes('does not exist') || e.includes('unknown')
+        );
+        if (schemaError) {
+          msg.push(`⚠️ Schema mismatch - update Supabase (see SUPABASE_MIGRATION.md)`);
+        } else {
+          msg.push(`${data.errors.length} error(s)`);
+        }
+      }
+      toast(msg.length ? `✅ Sync: ${msg.join(', ')}` : '✅ Up to date');
+      await refreshList();
+      await updateSyncStatus();
+      if (data.conflicts) openConflicts();
+    }
+  } catch(e) { toast('❌ Sync error: ' + e.message); }
+  finally { btn.textContent = '⟳ Sync'; btn.disabled = false; }
+}
+
+// ── Conflict Resolution ───────────────────────────────────────────────────────
+async function openConflicts() {
+  const res       = await fetch('/api/sync/conflicts');
+  const conflicts = await res.json();
+  const list      = document.getElementById('conflict-list');
+
+  if (!conflicts.length) {
+    list.innerHTML = '<p style="color:var(--fg2);font-size:13px">No conflicts — all clear ✅</p>';
+    document.getElementById('conflict-overlay').classList.add('open');
+    return;
+  }
+
+  const fields = ['customer','project_name','status','category',
+                  'task_summary','last_update','due_date'];
+
+  function fieldRow(label, lv, cv) {
+    const diff = (lv||'') !== (cv||'');
+    return `<div class="conf-field"><strong>${label}:</strong>
+      <span class="${diff?'conf-diff':''}">${esc(lv||'—')}</span>
+      ${diff ? `<span style="color:var(--fg2)"> ↔ </span>
+      <span class="conf-diff" style="background:color-mix(in srgb,#38bdf8 12%,transparent)">
+        ${esc(cv||'—')}</span>` : ''}
+    </div>`;
+  }
+
+  list.innerHTML = conflicts.map(c => {
+    const cloud = c.cloud_snapshot || {};
+    const isUnresolvable = c.conflict_type === 'unresolvable';
+    const warningMsg = isUnresolvable
+      ? `<div style="background:#7c2d2d;color:#fca5a5;padding:8px 12px;border-radius:6px;margin-bottom:10px;font-size:11px">
+          ⚠️ Unable to determine which version is newer. Please choose manually or keep both as backup.
+        </div>` : '';
+    return `<div class="conflict-card">
+      <div style="font-size:13px;font-weight:700;margin-bottom:10px">
+        📋 ${esc(c.customer||'?')} · ${esc(c.project_name||'?')}
+        <span style="font-size:10px;color:var(--fg2);font-weight:400;margin-left:8px">
+          detected ${esc(c.detected_at||'')}
+        </span>
+        ${isUnresolvable ? '<span style="background:#ef4444;color:#fff;padding:2px 6px;border-radius:4px;font-size:9px;margin-left:6px">NEEDS DECISION</span>' : ''}
+      </div>
+      ${warningMsg}
+      <div style="display:flex;gap:16px">
+        <div class="conflict-col local-col">
+          <h4>📝 My offline edits</h4>
+          ${fields.map(f => fieldRow(f, c[f], cloud[f])).join('')}
+        </div>
+        <div class="conflict-col cloud-col">
+          <h4>☁️ Cloud version</h4>
+          ${fields.map(f => fieldRow(f, cloud[f], c[f])).join('')}
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn btn-yellow btn-sm"
+                onclick="resolveConflict(${c.conflict_id},'local')">
+          ✅ Keep My Version
+        </button>
+        <button class="btn btn-accent btn-sm"
+                onclick="resolveConflict(${c.conflict_id},'cloud')">
+          ☁️ Use Cloud Version
+        </button>
+        ${isUnresolvable ? `<button class="btn btn-ghost btn-sm"
+                onclick="resolveConflict(${c.conflict_id},'backup')">
+          💾 Keep Both (Backup)
+        </button>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('conflict-overlay').classList.add('open');
+}
+
+function closeConflicts() {
+  document.getElementById('conflict-overlay').classList.remove('open');
+}
+
+async function resolveConflict(conflictId, keep) {
+  const res = await fetch(`/api/sync/conflicts/${conflictId}`, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({keep})
+  });
+  if (res.ok) {
+    toast(keep==='local' ? '✅ Kept local version' : '☁️ Using cloud version');
+    await openConflicts();
+    await refreshList();
+    await updateSyncStatus();
+  }
+}
+
+document.addEventListener('click', e => {
+  if (e.target.closest('#conflict-overlay') === document.getElementById('conflict-overlay')
+      && !e.target.closest('#conflict-modal')) closeConflicts();
+});
+
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeLightbox();
+});
+
+function openLightbox(src) {
+  const lb  = document.getElementById('lightbox');
+  const img = document.getElementById('lightbox-img');
+  img.src   = src;
+  // Reset any previous resize and let it size naturally up to viewport
+  img.style.width  = '';
+  img.style.height = '';
+  lb.classList.add('open');
+}
+function closeLightbox(e) {
+  // If called from backdrop click, only close when clicking the backdrop itself
+  if (e && e.target !== document.getElementById('lightbox') &&
+      e.target !== document.getElementById('lightbox-close')) return;
+  document.getElementById('lightbox').classList.remove('open');
+  document.getElementById('lightbox-img').src = '';
+}
+
+boot();
+startSyncPoller();
+</script>
+</body>
+</html>"""
+
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+@app.route("/manifest.json")
+def manifest():
+    return jsonify({
+        "name":             "Work Log Journal",
+        "short_name":       "Work Log",
+        "start_url":        "/",
+        "display":          "standalone",
+        "background_color": "#0f172a",
+        "theme_color":      "#0f172a",
+        "icons": [
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+        ]
+    })
+
+if __name__ == "__main__":
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", 5000))
+
+    # ── Startup diagnostics ───────────────────────────────────────────────────
+    env_file = Path(__file__).parent / ".env"
+    print(f"\n  Work Log Journal  — http://localhost:{port}")
+    print(f"  Local network:     http://<your-ip>:{port}")
+    print(f"  .env file:         {'FOUND  ✓  ' + str(env_file) if env_file.exists() else 'NOT FOUND — create .env next to app.py'}")
+    print(f"  SUPABASE_URL:      {SUPABASE_URL[:40] + '…' if SUPABASE_URL else '(not set)'}")
+    print(f"  SUPABASE_KEY:      {'set ✓' if SUPABASE_KEY else '(not set)'}")
+    print(f"  supabase library:  {'installed ✓' if HAS_SUPABASE else 'MISSING — run: pip install supabase'}")
+    if HAS_SUPABASE and SUPABASE_URL and SUPABASE_KEY:
+        print(f"  DB:                Supabase (cloud) ✓")
+    else:
+        reasons = []
+        if not HAS_SUPABASE:   reasons.append("supabase not installed")
+        if not SUPABASE_URL:   reasons.append("SUPABASE_URL missing")
+        if not SUPABASE_KEY:   reasons.append("SUPABASE_KEY missing")
+        print(f"  DB:                SQLite (local)  — {', '.join(reasons)}")
+    print()
+    app.run(host=host, port=port, debug=False)

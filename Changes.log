@@ -1,0 +1,199 @@
+# Changes Log
+
+## 2026-03-27
+
+### Version 0.9.5 Features
+
+1. **Project Schedule field:**
+   - Markdown-enabled field for project milestones (NO preview, as per spec)
+   - Simple textarea with Markdown support
+   - Added to database schema, form, and table display
+   - Supports **bold**, *italic*, __underline__, ~~strikethrough__
+
+2. **Excel export (.xlsx):**
+   - Only specified columns exported (9 columns total)
+   - Column mapping: Customer -> OEM/ODM/OBM/Disti, SSO/ModelN# -> SSO#, MCHP Device -> Microchip Devices, Task Summary -> Status/Update, Project Schedule -> Timeline
+   - Styled headers and auto-sized columns
+   - Exports checked records
+
+3. **PDF export (.pdf):**
+   - Landscape A4 format
+   - Column mapping consistent with Excel
+   - Compact table with key fields
+
+4. **Database size display:**
+   - Shows Supabase table size (estimated from row count) when online
+   - Falls back to local SQLite file size when offline
+   - Format: "DB: ~1.3 MB (Supabase)" or "DB: 1.3 MB (Local)"
+   - Updates every 15 seconds
+
+5. **Supabase sync improvements:**
+   - Removed filter that blocked new columns from syncing
+   - Added schema validation API (/api/sync/check-schema)
+   - Enhanced error messages when schema mismatch detected
+   - Prompt user with missing columns and migration instructions
+   - Added SUPABASE_MIGRATION.md with step-by-step upgrade guide
+
+6. **Files updated:**
+   - app.py: New field, export APIs, sync logic
+   - schema.sql: Added project_schedule, migration instructions
+   - requirements.txt: Added openpyxl, fpdf2
+   - worklog.spec: Added Excel/PDF imports
+   - VERSION: 0.9.5
+   - SUPABASE_MIGRATION.md: New migration guide
+
+---
+
+## 2026-03-26
+
+### Version 0.9.4 Features
+
+1. **Cloud backup on startup:**
+   - Creates JSON backup of Supabase data when online
+   - Backup saved to: `supabase_backup_YYYYMMDD.json`
+
+2. **Enhanced timestamp-based conflict resolution:**
+   - Uses `local_updated_at` for precise timestamp comparison
+   - Auto-resolves conflicts by keeping newer timestamp
+   - When timestamps are identical, local edits take priority
+
+3. **User prompt for unresolvable conflicts:**
+   - New conflict type: "unresolvable" for conflicts that cannot be auto-resolved
+   - Special UI indicator: "NEEDS DECISION" badge
+   - New option: "Keep Both (Backup)" - creates backup copy of cloud version
+   - Backup copies marked with "(Backup)" suffix in customer field
+
+4. **Database changes:**
+   - Added `conflict_type` column to sync_conflicts table
+   - Migration for existing databases
+
+5. **Files updated:**
+   - app.py: SyncEngine, LocalDB, conflict resolution UI
+   - VERSION: 0.9.3 -> 0.9.4
+   - launcher.py: APP_VERSION -> 0.9.4
+   - version_info.txt: Updated to 0.9.4
+
+---
+
+### Version 0.9.3 Features
+
+1. **Table column reordering:**
+   - New order: Week, Create Date, Due Date, BU, SSO/ModelN#, EAR(K$), Application, MCHP Device, Category, Status, Task Summary, Worklogs, Last Update, Archive
+   - Removed Customer and Project columns from table display
+   - Total columns reduced from 16 to 14
+
+2. **Files updated:**
+   - app.py: Table headers and row rendering
+   - VERSION: 0.9.2 -> 0.9.3
+   - launcher.py: APP_VERSION -> 0.9.3
+   - version_info.txt: Updated to 0.9.3
+
+---
+
+### Version 0.9.2 Features
+
+1. **New database fields:**
+   - EAR(K$) (max 20 characters) - added below SSO/ModelN#
+   - BU dropdown (DCS, NCS options)
+
+2. **Field modifications:**
+   - SSO/ModelN# length changed from 20 to 10 characters
+   - "Inquiries" renamed to "MCHP Device"
+
+3. **Version display:**
+   - Updated to "v0.9.2 by Keynes Hsu"
+
+4. **Supabase compatibility:**
+   - Added column mapping for sync (inquiries <-> mchp_device)
+   - Pull: Maps old 'inquiries' column to new 'mchp_device'
+   - Push: Maps 'mchp_device' back to 'inquiries' for old schemas
+   - New columns (ear, bu) are local-only until cloud schema is updated
+
+5. **Files updated:**
+   - app.py: Form fields, table columns, fillForm, buildPayload, SyncEngine
+   - schema.sql: Added ear, bu, mchp_device columns; migration instructions
+   - launcher.py: APP_VERSION -> 0.9.2
+   - VERSION: 0.9.1 -> 0.9.2
+   - version_info.txt: Updated to 0.9.2
+
+---
+
+### Version 0.9.1 Features
+
+1. **Worklogs Markdown enhancements:**
+   - Added underline support: `__text__` -> underlined text
+   - Added strikethrough support: `~~text~~` -> strikethrough text
+   - Both work in preview and Word export
+
+2. **Version display:**
+   - Added version badge (v0.9.1) in top-right corner of toolbar
+
+3. **New database fields:**
+   - SSO/ModelN# (max 20 characters)
+   - Application (max 50 characters)
+   - Added to form, table display, and database schema
+
+4. **Files updated:**
+   - app.py: inlineM function, add_inline function, form fields, table columns
+   - schema.sql: Added sso_modeln and application columns
+   - launcher.py: APP_VERSION -> 0.9.1
+   - VERSION: 0.9.0 -> 0.9.1
+   - version_info.txt: Updated to 0.9.1
+
+---
+
+### Word Export Format Adjustments
+
+**Modified file:** app.py
+
+1. **Column widths standardized to 3cm:**
+   - Customer label column: 13cm -> 3cm
+   - Project label column: 12.9cm -> 3cm
+   - Task Summary label column: 3.5cm -> 3cm
+   - Date column: 2.8cm -> 3cm
+
+2. **Header table restructured:**
+   - Changed from 1-row, 2-column (Customer + Project side-by-side)
+   - To 2-row, 2-column (Customer row + Project row with separate label columns)
+   - Label columns now centered
+
+3. **Default font size standardized to 10pt:**
+   - Content text (add_inline): 9pt -> 10pt
+   - Bullet list prefix: 9pt -> 10pt
+   - _cell function default: 8pt -> 10pt
+   - _hdr_row function default: 8pt -> 10pt
+   - Task Summary label: 8pt -> 10pt
+   - Date cell values: 8pt -> 10pt
+
+4. **Text alignment:**
+   - Added justified alignment (left-right) for regular text paragraphs
+   - Added justified alignment for inline image text paragraphs
+
+5. **Fixed _set_widths function for consistent column widths:**
+   - Now sets column widths on table.columns (applies to all rows)
+   - Also sets cell widths for existing rows
+   - Ensures dynamically added rows (et.add_row()) maintain consistent widths
+
+### Windows Executable Packaging
+
+**New files added:**
+
+1. **build.bat** - Build script for Windows
+   - Checks Python and PyInstaller installation
+   - Installs dependencies automatically
+   - Cleans previous build and creates new executable
+
+2. **worklog.spec** - PyInstaller specification file
+   - Configures bundled files (app.py, schema.sql, VERSION, .env.example)
+   - Includes all required hidden imports (Flask, Supabase, python-docx, Pillow, etc.)
+   - GUI mode (no console window)
+   - UPX compression enabled
+
+3. **version_info.txt** - Windows version information
+   - File version: 0.9.1
+   - Product name: Work Log Journal
+
+**Build instructions:**
+1. Install Python 3.10+
+2. Run `build.bat`
+3. Output: `dist\WorkLog\WorkLog.exe`
