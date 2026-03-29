@@ -20,6 +20,8 @@ import webbrowser
 import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
+import zipfile
+import shutil
 
 # ── Determine data directory (writable even when packaged) ───────────────────
 if getattr(sys, 'frozen', False):
@@ -30,8 +32,10 @@ else:
     APP_DIR  = Path(__file__).parent
     BASE_DIR = Path(__file__).parent
 
-APP_VERSION = "0.9.5"
+APP_VERSION = "0.9.6"
 ENV_FILE = APP_DIR / ".env"
+VERSION_FILE = APP_DIR / ".last_version"
+BACKUP_DIR = APP_DIR / "backups"
 PORT     = 5000   # default; _find_free_port() may change this at runtime
 
 # ── Colours ──────────────────────────────────────────────────────────────────
@@ -223,6 +227,9 @@ class ControlWindow(tk.Tk):
 
     # ── Boot sequence ─────────────────────────────────────────────────────────
     def _boot(self):
+        # Check version and create backup if needed
+        _check_and_backup()
+
         env = _load_env()
         if _needs_setup(env):
             self.after(100, self._run_setup)
@@ -291,6 +298,60 @@ class ControlWindow(tk.Tk):
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+def _check_and_backup():
+    """
+    Check if the version has changed since last run.
+    If yes, create a backup of the previous version's files.
+    """
+    try:
+        last_version = None
+        if VERSION_FILE.exists():
+            last_version = VERSION_FILE.read_text(encoding="utf-8").strip()
+
+        # If version has changed and this is not the first run
+        if last_version and last_version != APP_VERSION:
+            # Create backups directory if it doesn't exist
+            BACKUP_DIR.mkdir(exist_ok=True)
+
+            # Create backup filename with version number
+            backup_name = f"WorkLog_v{last_version}_backup.zip"
+            backup_path = BACKUP_DIR / backup_name
+
+            # Skip if backup already exists
+            if not backup_path.exists():
+                # Files to backup
+                files_to_backup = [
+                    "app.py",
+                    "launcher.py",
+                    "VERSION",
+                    "requirements.txt",
+                    "worklog.spec",
+                    "schema.sql",
+                    ".env.example"
+                ]
+
+                # Create zip backup
+                with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for filename in files_to_backup:
+                        file_path = APP_DIR / filename
+                        if file_path.exists():
+                            zipf.write(file_path, filename)
+
+                    # Also backup WorkLog.db if it exists
+                    db_path = APP_DIR / "WorkLog.db"
+                    if db_path.exists():
+                        zipf.write(db_path, "WorkLog.db")
+
+                print(f"✓ Backup created: {backup_name}")
+
+        # Update version file
+        VERSION_FILE.write_text(APP_VERSION, encoding="utf-8")
+
+    except Exception as e:
+        print(f"Warning: Backup failed: {e}", file=sys.stderr)
+        # Don't fail startup if backup fails
+
+
 def _load_env() -> dict:
     """Read .env file into a dict."""
     env = {}

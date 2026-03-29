@@ -5,6 +5,23 @@ Format: [Semantic Versioning](https://semver.org)
 
 ---
 
+## [v0.9.7] — 2026-03-29
+
+- Full iOS/Android native app via Capacitor or React Native
+- Multi-user authentication (Supabase Row Level Security per user)
+- Attachment support (non-image files)
+- Rich-text editor (WYSIWYG instead of Markdown)
+- 程式修改進行程式檢查及測試，然後執行Clean build。
+
+## [v0.9.6] — 2026-03-29
+
+- 程式碼修改前對前一個版本程式碼先進行完整備份壓縮成.zip，壓縮檔名加註程式版本編號。
+- 若程式無法進行判斷資料衝突情況，則出現提示方塊，並顯示比對差異，讓使用者決定是否保留為副本。
+- 完整移除Worklogs編輯時進行英文單字及文法檢查建議功能。
+- PDF輸出版面以A4橫式為主，自動調整版面格式，盡量將所有資料縮放以符合頁寬。允許Task Summary, Worklogs內容自動換行
+- 確保MacOS, iOS程式一併完整修正。
+- 程式修改進行程式檢查及測試，然後執行Clean build。
+
 ## [v0.9.5] — 2026-03-27
 
 - 增加"Project Schedule"，欄位具有如Worklogs的Markdown功能，但不需要預覽功能

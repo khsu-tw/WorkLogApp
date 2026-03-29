@@ -1053,46 +1053,116 @@ def api_export_pdf():
         if not rows:
             return jsonify({"error": "No records to export"}), 400
 
+        # v0.9.6: A4 Landscape, auto-adjust format, fit data to page width
+        # Allow Task Summary and Worklogs multi-line wrapping
         pdf = FPDF(orientation='L', unit='mm', format='A4')
-        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.set_auto_page_break(auto=True, margin=10)
         pdf.add_page()
+
+        # Calculate available width (A4 landscape = 297mm, minus margins)
+        page_width = 297 - 20  # 277mm usable width
 
         # Title
         pdf.set_font("Helvetica", "B", 16)
         pdf.cell(0, 10, "Work Log Report", ln=True, align='C')
         pdf.set_font("Helvetica", "", 10)
-        pdf.cell(0, 6, f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}  |  {len(rows)} record(s)", ln=True, align='C')
-        pdf.ln(5)
+        pdf.cell(0, 5, f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}  |  {len(rows)} record(s)", ln=True, align='C')
+        pdf.ln(4)
 
-        # Column headers (matching Excel export per CHANGELOG v0.9.5)
-        headers = ["OEM/ODM/OBM/Disti", "SSO#", "Project", "Application", "BU", "MCHP Devices", "Status/Update", "EAR(K$)", "Timeline"]
-        col_widths = [32, 18, 28, 32, 14, 32, 50, 18, 26]
+        # Column setup for A4 Landscape - optimized to fit page width
+        headers = ["Customer", "SSO#", "Project", "Application", "BU", "MCHP Device", "Task Summary", "EAR(K$)", "Timeline"]
+        col_widths = [28, 15, 26, 30, 12, 28, 60, 15, 25]  # Total = 239mm
+
+        # Auto-scale to fit page width
+        total_width = sum(col_widths)
+        if total_width > page_width:
+            scale_factor = page_width / total_width
+            col_widths = [w * scale_factor for w in col_widths]
 
         pdf.set_font("Helvetica", "B", 8)
         pdf.set_fill_color(30, 58, 95)
         pdf.set_text_color(255, 255, 255)
         for i, header in enumerate(headers):
-            pdf.cell(col_widths[i], 8, header, border=1, align='C', fill=True)
+            pdf.cell(col_widths[i], 7, header, border=1, align='C', fill=True)
         pdf.ln()
 
-        # Data rows
+        # Data rows with multi-line support for Task Summary column
         pdf.set_font("Helvetica", "", 7)
         pdf.set_text_color(0, 0, 0)
+
         for row in rows:
-            data = [
-                (row.get("customer") or "")[:28],
-                (row.get("sso_modeln") or "")[:14],
-                (row.get("project_name") or "")[:24],
-                (row.get("application") or "")[:28],
-                (row.get("bu") or "")[:10],
-                (row.get("mchp_device") or "")[:28],
-                (row.get("task_summary") or "")[:45],
-                (row.get("ear") or "")[:14],
-                (row.get("project_schedule") or "")[:22],
-            ]
-            for i, val in enumerate(data):
-                pdf.cell(col_widths[i], 6, val, border=1, align='L')
-            pdf.ln()
+            # Prepare data
+            customer = (row.get("customer") or "")
+            sso = (row.get("sso_modeln") or "")
+            project = (row.get("project_name") or "")
+            application = (row.get("application") or "")
+            bu = (row.get("bu") or "")
+            device = (row.get("mchp_device") or "")
+            task_summary = (row.get("task_summary") or "")  # Allow full text with wrapping
+            ear = (row.get("ear") or "")
+            timeline = (row.get("project_schedule") or "")
+
+            # Calculate row height based on Task Summary text (allow wrapping)
+            summary_width_mm = col_widths[6]
+            chars_per_line = int(summary_width_mm / 1.3)  # Approx chars per line at 7pt
+
+            # Split Task Summary into lines (word wrap)
+            summary_lines = []
+            if task_summary:
+                words = task_summary.split()
+                current_line = ""
+                for word in words:
+                    test_line = current_line + (" " if current_line else "") + word
+                    if len(test_line) <= chars_per_line:
+                        current_line = test_line
+                    else:
+                        if current_line:
+                            summary_lines.append(current_line)
+                        current_line = word
+                if current_line:
+                    summary_lines.append(current_line)
+
+            if not summary_lines:
+                summary_lines = [""]
+
+            # Calculate row height
+            line_height = 4
+            row_height = max(6, len(summary_lines) * line_height)
+
+            # Store starting position
+            start_x = pdf.get_x()
+            start_y = pdf.get_y()
+
+            # Draw cells - first 6 columns (before Task Summary)
+            data_cols = [customer, sso, project, application, bu, device]
+            x_offset = 0
+            for i, val in enumerate(data_cols):
+                # Truncate to fit
+                max_chars = int(col_widths[i] / 1.3)
+                truncated = val[:max_chars] if len(val) > max_chars else val
+                pdf.set_xy(start_x + x_offset, start_y)
+                pdf.cell(col_widths[i], row_height, truncated, border=1, align='L')
+                x_offset += col_widths[i]
+
+            # Draw Task Summary column with multi-line text
+            summary_x = start_x + x_offset
+            pdf.rect(summary_x, start_y, col_widths[6], row_height)
+            for line_idx, line in enumerate(summary_lines):
+                pdf.set_xy(summary_x + 1, start_y + 1 + line_idx * line_height)
+                pdf.cell(col_widths[6] - 2, line_height, line, border=0, align='L')
+            x_offset += col_widths[6]
+
+            # Draw last 2 columns (EAR, Timeline)
+            pdf.set_xy(start_x + x_offset, start_y)
+            ear_truncated = ear[:int(col_widths[7] / 1.3)]
+            pdf.cell(col_widths[7], row_height, ear_truncated, border=1, align='L')
+            x_offset += col_widths[7]
+            pdf.set_xy(start_x + x_offset, start_y)
+            timeline_truncated = timeline[:int(col_widths[8] / 1.3)]
+            pdf.cell(col_widths[8], row_height, timeline_truncated, border=1, align='L')
+
+            # Move to next row
+            pdf.set_xy(start_x, start_y + row_height)
 
         buf = io.BytesIO()
         pdf.output(buf)
@@ -1701,7 +1771,7 @@ HTML = r"""<!DOCTYPE html>
     <button class="btn btn-ghost"  onclick="exportPdf()">📑 <span>PDF</span></button>
     <div class="spacer"></div>
     <span id="db-size-badge" style="font-size:10px;color:var(--fg2);margin-right:8px">DB: --</span>
-    <span id="version-badge">v0.9.5 by Keynes Hsu</span>
+    <span id="version-badge">v0.9.6 by Keynes Hsu</span>
     <button class="theme-btn" onclick="cycleTheme()" title="Toggle theme" id="theme-icon">🌙</button>
     <button class="btn btn-ghost btn-sm" onclick="refreshList()">🔄</button>
   </div>
@@ -3002,21 +3072,21 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", 5000))
 
-    # ── Startup diagnostics ───────────────────────────────────────────────────
+    # Startup diagnostics
     env_file = Path(__file__).parent / ".env"
-    print(f"\n  Work Log Journal  — http://localhost:{port}")
+    print(f"\n  Work Log Journal - http://localhost:{port}")
     print(f"  Local network:     http://<your-ip>:{port}")
-    print(f"  .env file:         {'FOUND  ✓  ' + str(env_file) if env_file.exists() else 'NOT FOUND — create .env next to app.py'}")
-    print(f"  SUPABASE_URL:      {SUPABASE_URL[:40] + '…' if SUPABASE_URL else '(not set)'}")
-    print(f"  SUPABASE_KEY:      {'set ✓' if SUPABASE_KEY else '(not set)'}")
-    print(f"  supabase library:  {'installed ✓' if HAS_SUPABASE else 'MISSING — run: pip install supabase'}")
+    print(f"  .env file:         {'FOUND [OK] ' + str(env_file) if env_file.exists() else 'NOT FOUND - create .env next to app.py'}")
+    print(f"  SUPABASE_URL:      {SUPABASE_URL[:40] + '...' if SUPABASE_URL else '(not set)'}")
+    print(f"  SUPABASE_KEY:      {'set [OK]' if SUPABASE_KEY else '(not set)'}")
+    print(f"  supabase library:  {'installed [OK]' if HAS_SUPABASE else 'MISSING - run: pip install supabase'}")
     if HAS_SUPABASE and SUPABASE_URL and SUPABASE_KEY:
-        print(f"  DB:                Supabase (cloud) ✓")
+        print(f"  DB:                Supabase (cloud) [OK]")
     else:
         reasons = []
         if not HAS_SUPABASE:   reasons.append("supabase not installed")
         if not SUPABASE_URL:   reasons.append("SUPABASE_URL missing")
         if not SUPABASE_KEY:   reasons.append("SUPABASE_KEY missing")
-        print(f"  DB:                SQLite (local)  — {', '.join(reasons)}")
+        print(f"  DB:                SQLite (local) - {', '.join(reasons)}")
     print()
     app.run(host=host, port=port, debug=False)
