@@ -4,10 +4,10 @@ Work Log Journal  — Cross-Platform Web App
 Runs on Windows, macOS, iOS (Safari PWA), Android
 
 Setup:
-    pip install flask supabase python-docx Pillow
+    pip install flask pocketbase python-docx Pillow
 
-Cloud DB (Supabase — free tier):
-    1. Create account at https://supabase.com
+Cloud DB (PocketBase — free tier):
+    1. Create account at https://pocketbase.com
     2. New project → SQL Editor → run schema.sql
     3. Copy Project URL + anon key into .env or config below
 
@@ -40,12 +40,14 @@ except ImportError:
 
 from flask import Flask, request, jsonify, render_template_string, send_file
 
-# ── Optional cloud DB (Supabase) ────────────────────────────────────────────
+# ── Optional cloud DB (PocketBase) ──────────────────────────────────────────
 try:
-    from supabase import create_client
-    HAS_SUPABASE = True
+    from pocketbase import PocketBase
+    HAS_POCKETBASE = True
 except ImportError:
-    HAS_SUPABASE = False
+    HAS_POCKETBASE = False
+
+import requests  # For PocketBase health check
 
 # ── Optional Word export ─────────────────────────────────────────────────────
 try:
@@ -88,9 +90,9 @@ app.secret_key = os.environ.get("SECRET_KEY", "worklog-dev-key-change-in-prod")
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION  — edit these or set as environment variables
 # ─────────────────────────────────────────────────────────────────────────────
-SUPABASE_URL  = os.environ.get("SUPABASE_URL",  "")
-SUPABASE_KEY  = os.environ.get("SUPABASE_KEY",  "")
-TABLE         = "worklog"
+POCKETBASE_URL = os.environ.get("POCKETBASE_URL", "http://127.0.0.1:8090")
+POCKETBASE_TOKEN = os.environ.get("POCKETBASE_TOKEN", "")
+TABLE = "worklog"
 
 # Resolve DB path relative to the executable (works both packaged and in dev)
 def _resolve_db_path() -> str:
@@ -118,7 +120,7 @@ CATEGORY_OPTIONS = ["General","Visit","Training","Tech Support","Design Review",
 """
 Architecture:
   LocalDB  — always used for reads/writes (SQLite, always fast, works offline)
-  CloudDB  — Supabase, used only when online
+  CloudDB  — PocketBase, used only when online
   SyncEngine — background thread; pushes pending_sync rows to cloud,
                detects conflicts by comparing last_update timestamps,
                pulls new/updated cloud rows not yet in local cache.
@@ -394,39 +396,32 @@ def _has_local_data() -> bool:
 
 # ── Cloud connectivity check ──────────────────────────────────────────────────
 def _is_online() -> bool:
-    """True when Supabase is reachable and credentials are valid."""
-    if not _supabase_configured():
+    """True when PocketBase is reachable."""
+    if not _pocketbase_configured():
         return False
-    url = os.environ.get("SUPABASE_URL", SUPABASE_URL)
-    key = os.environ.get("SUPABASE_KEY", SUPABASE_KEY)
+    url = os.environ.get("POCKETBASE_URL", POCKETBASE_URL)
     try:
-        import urllib.request, urllib.error
-        req_url = url.rstrip("/") + f"/rest/v1/{TABLE}?select=id&limit=1"
-        req = urllib.request.Request(req_url, headers={
-            "apikey":        key,
-            "Authorization": f"Bearer {key}",
-        }, method="HEAD")
-        with urllib.request.urlopen(req, timeout=5):
-            return True
-    except urllib.error.HTTPError as e:
-        return e.code in (200, 204, 406)
+        resp = requests.get(f"{url.rstrip('/')}/api/health", timeout=3)
+        return resp.status_code == 200
     except Exception:
         return False
 
 
 def _cloud_client():
-    """Always read SUPABASE_URL/KEY from env at call time so launcher-set values work."""
-    url = os.environ.get("SUPABASE_URL", SUPABASE_URL)
-    key = os.environ.get("SUPABASE_KEY", SUPABASE_KEY)
-    return create_client(url, key)
+    """Create PocketBase client with optional token authentication."""
+    url = os.environ.get("POCKETBASE_URL", POCKETBASE_URL)
+    pb = PocketBase(url)
+    token = os.environ.get("POCKETBASE_TOKEN", POCKETBASE_TOKEN)
+    if token:
+        pb.auth_store.save(token)
+    return pb
 
 
-def _supabase_configured() -> bool:
-    """Check live env vars, not the cached module-level ones."""
+def _pocketbase_configured() -> bool:
+    """Check if PocketBase is configured."""
     return bool(
-        HAS_SUPABASE
-        and os.environ.get("SUPABASE_URL", SUPABASE_URL)
-        and os.environ.get("SUPABASE_KEY", SUPABASE_KEY)
+        HAS_POCKETBASE
+        and os.environ.get("POCKETBASE_URL", POCKETBASE_URL)
     )
 
 
@@ -448,20 +443,21 @@ class SyncEngine:
 
     def start(self):
         self._thread.start()
-        # On first start: if we have Supabase configured and no local data yet,
+        # On first start: if we have PocketBase configured and no local data yet,
         # do an immediate pull so the user sees cloud data right away.
         _threading.Thread(target=self._initial_pull, daemon=True).start()
 
     def _create_cloud_backup(self):
         """Create a JSON backup of all cloud data in the local directory."""
         try:
-            sb = _cloud_client()
-            if not sb:
+            pb = _cloud_client()
+            if not pb:
                 return
-            cloud_rows = sb.table(TABLE).select("*").execute().data or []
+            records = pb.collection(TABLE).get_full_list()
+            cloud_rows = [self._pb_record_to_dict(r) for r in records]
             if cloud_rows:
                 backup_dir = os.path.dirname(SQLITE_PATH)
-                backup_file = os.path.join(backup_dir, f"supabase_backup_{datetime.date.today().strftime('%Y%m%d')}.json")
+                backup_file = os.path.join(backup_dir, f"pocketbase_backup_{datetime.date.today().strftime('%Y%m%d')}.json")
                 with open(backup_file, "w", encoding="utf-8") as f:
                     json.dump(cloud_rows, f, ensure_ascii=False, indent=2, default=str)
                 print(f"  Cloud backup created: {backup_file}")
@@ -522,10 +518,10 @@ class SyncEngine:
 
         return report
 
-    # ── Push pending local rows to Supabase ───────────────────────────────────
+    # ── Push pending local rows to PocketBase ─────────────────────────────────
     def _push(self, report: dict):
-        db  = _get_local_db()
-        sb  = _cloud_client()
+        db = _get_local_db()
+        pb = _cloud_client()
         pending = db.pending_rows()
 
         for row in pending:
@@ -536,7 +532,7 @@ class SyncEngine:
             if row["sync_status"] == "deleted":
                 if cloud_id:
                     try:
-                        sb.table(TABLE).delete().eq("id", cloud_id).execute()
+                        pb.collection(TABLE).delete(cloud_id)
                     except Exception:
                         pass
                 c = db._conn()
@@ -549,49 +545,47 @@ class SyncEngine:
             payload = {k: v for k, v in row.items()
                        if k not in ("id","cloud_id","sync_status","local_updated_at")}
 
-            # Note: Ensure your Supabase database has been updated with new columns
-            # Run the migration SQL in schema.sql if you haven't already
+            # Note: Ensure your PocketBase collection has been configured with the required fields
 
             if cloud_id:
                 # Check for conflict: compare timestamps (use local_updated_at for precision)
-                cloud_rows = sb.table(TABLE).select("id,last_update,created_at").eq(
-                    "id", cloud_id).execute().data
-                if cloud_rows:
-                    cloud_lu = (cloud_rows[0].get("last_update") or "")
+                try:
+                    cloud_row = pb.collection(TABLE).get_one(cloud_id)
+                    cloud_lu = getattr(cloud_row, 'last_update', '') or ''
                     local_lu = (row.get("last_update") or "")
                     local_updated = (row.get("local_updated_at") or "")
 
                     # Enhanced conflict resolution based on timestamps
                     if cloud_lu and local_lu:
                         if cloud_lu > local_lu:
-                            # Cloud is newer - check if we should auto-resolve or flag for user
-                            full = sb.table(TABLE).select("*").eq("id", cloud_id).execute().data
-                            if full:
-                                db.mark_conflict(local_id, full[0])
-                                report["conflicts"] += 1
-                                continue
-                        elif cloud_lu == local_lu and local_updated:
-                            # Same last_update but local has been modified - local wins (more recent edit)
-                            pass  # Continue to push
-                        # else: local is newer or equal, push local changes
-                    elif not cloud_lu and not local_lu:
-                        # Both timestamps missing - flag as unresolvable conflict for user decision
-                        full = sb.table(TABLE).select("*").eq("id", cloud_id).execute().data
-                        if full:
-                            db.mark_conflict(local_id, full[0], conflict_type="unresolvable")
+                            # Cloud is newer - flag for user
+                            cloud_data = {k: getattr(cloud_row, k, None) for k in dir(cloud_row) if not k.startswith('_')}
+                            db.mark_conflict(local_id, cloud_data)
                             report["conflicts"] += 1
                             continue
+                        elif cloud_lu == local_lu and local_updated:
+                            # Same last_update but local has been modified - local wins
+                            pass  # Continue to push
+                    elif not cloud_lu and not local_lu:
+                        # Both timestamps missing - flag as unresolvable conflict
+                        cloud_data = {k: getattr(cloud_row, k, None) for k in dir(cloud_row) if not k.startswith('_')}
+                        db.mark_conflict(local_id, cloud_data, conflict_type="unresolvable")
+                        report["conflicts"] += 1
+                        continue
+                except Exception:
+                    pass  # Record not found in cloud, will be created
+
                 try:
-                    sb.table(TABLE).update(payload).eq("id", cloud_id).execute()
+                    pb.collection(TABLE).update(cloud_id, payload)
                     db.mark_synced(local_id, cloud_id)
                     report["pushed"] += 1
                 except Exception as e:
                     report["errors"].append(f"update {local_id}: {e}")
             else:
                 try:
-                    result = sb.table(TABLE).insert(payload).execute().data
+                    result = pb.collection(TABLE).create(payload)
                     if result:
-                        new_cloud_id = result[0]["id"]
+                        new_cloud_id = result.id
                         db.mark_synced(local_id, new_cloud_id)
                         report["pushed"] += 1
                 except Exception as e:
@@ -599,8 +593,8 @@ class SyncEngine:
 
     # ── Pull cloud rows into local cache ──────────────────────────────────────
     def _normalize_cloud_row(self, row: dict) -> dict:
-        """Map old Supabase column names to new local schema."""
-        # Map old 'inquiries' to new 'mchp_device' if cloud still has old schema
+        """Map PocketBase record to local schema."""
+        # Map old 'inquiries' to new 'mchp_device' if exists
         if "inquiries" in row and "mchp_device" not in row:
             row["mchp_device"] = row.pop("inquiries")
         # Ensure new columns have defaults if missing from cloud
@@ -612,14 +606,24 @@ class SyncEngine:
         row.setdefault("project_schedule", "")
         return row
 
+    def _pb_record_to_dict(self, record) -> dict:
+        """Convert PocketBase record object to dictionary."""
+        result = {}
+        for field in ["id", "week", "due_date", "customer", "project_name", "sso_modeln",
+                      "ear", "application", "bu", "task_summary", "mchp_device",
+                      "project_schedule", "status", "category", "worklogs", "create_date",
+                      "last_update", "archive", "record_hash", "created", "updated"]:
+            result[field] = getattr(record, field, None)
+        return result
+
     def _pull(self, report: dict):
         db = _get_local_db()
-        sb = _cloud_client()
+        pb = _cloud_client()
 
-        # Fetch ALL cloud rows; use last_update (not updated_at) to decide freshness
+        # Fetch ALL cloud rows from PocketBase
         try:
-            cloud_rows = sb.table(TABLE).select("*").order(
-                "id", desc=False).execute().data or []
+            records = pb.collection(TABLE).get_full_list()
+            cloud_rows = [self._pb_record_to_dict(r) for r in records]
         except Exception as e:
             report["errors"].append(f"pull fetch: {e}")
             return
@@ -627,18 +631,18 @@ class SyncEngine:
         for crow in cloud_rows:
             crow = self._normalize_cloud_row(crow)
             cloud_id = str(crow["id"])
-            local    = db.find_by_cloud_id(cloud_id)
+            local = db.find_by_cloud_id(cloud_id)
 
             if local is None:
                 # New cloud row not yet in local
                 payload = {k: v for k, v in crow.items()
-                           if k not in ("created_at",)}
+                           if k not in ("created", "updated")}
                 payload.pop("id", None)
-                payload["cloud_id"]        = cloud_id
-                payload["sync_status"]     = "synced"
+                payload["cloud_id"] = cloud_id
+                payload["sync_status"] = "synced"
                 payload["local_updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 # Remove unknown columns
-                for col in ("updated_at", "inquiries"):
+                for col in ("created", "updated", "inquiries"):
                     payload.pop(col, None)
                 try:
                     db.insert(payload)
@@ -650,15 +654,16 @@ class SyncEngine:
                 local_lu = local.get("last_update") or ""
                 if cloud_lu and cloud_lu > local_lu:
                     payload = {k: v for k, v in crow.items()
-                               if k not in ("id","created_at","updated_at","inquiries")}
-                    payload["cloud_id"]        = cloud_id
-                    payload["sync_status"]     = "synced"
+                               if k not in ("id", "created", "updated", "inquiries")}
+                    payload["cloud_id"] = cloud_id
+                    payload["sync_status"] = "synced"
                     payload["local_updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
                     # Filter only valid local columns
-                    valid_cols = {"week","due_date","customer","project_name","sso_modeln",
-                                  "ear","application","bu","task_summary","mchp_device",
-                                  "status","category","worklogs","create_date","last_update",
-                                  "archive","record_hash","cloud_id","sync_status","local_updated_at"}
+                    valid_cols = {"week", "due_date", "customer", "project_name", "sso_modeln",
+                                  "ear", "application", "bu", "task_summary", "mchp_device",
+                                  "project_schedule", "status", "category", "worklogs", "create_date",
+                                  "last_update", "archive", "record_hash", "cloud_id", "sync_status",
+                                  "local_updated_at"}
                     payload = {k: v for k, v in payload.items() if k in valid_cols}
                     sets = ", ".join([f"{k}=?" for k in payload])
                     c = db._conn()
@@ -820,14 +825,14 @@ def api_sync_status():
 @app.route("/api/sync/test", methods=["GET"])
 def api_sync_test():
     """Verify connectivity and return detailed diagnostics."""
-    configured = _supabase_configured()
+    configured = _pocketbase_configured()
     online     = _is_online() if configured else False
-    url        = os.environ.get("SUPABASE_URL", SUPABASE_URL)
+    url        = os.environ.get("POCKETBASE_URL", POCKETBASE_URL)
     return jsonify({
         "configured": configured,
         "online":     online,
         "url":        url[:40] + "…" if len(url) > 40 else url,
-        "has_supabase_lib": HAS_SUPABASE,
+        "has_pocketbase_lib": HAS_POCKETBASE,
     })
 
 @app.route("/api/sync/now", methods=["POST"])
@@ -864,7 +869,7 @@ def api_config():
         "status_options":   STATUS_OPTIONS,
         "category_options": CATEGORY_OPTIONS,
         "today":            today_str(),
-        "db_type":          "Supabase + Local Cache" if _supabase_configured() else "SQLite (local only)",
+        "db_type":          "PocketBase + Local Cache" if _pocketbase_configured() else "SQLite (local only)",
         "has_docx":         HAS_DOCX,
         "version":          APP_VERSION,
         "sync":             sync,
@@ -1177,15 +1182,13 @@ def api_export_pdf():
 
 @app.route("/api/db/size", methods=["GET"])
 def api_db_size():
-    """Return the Supabase database table size (estimated) or local SQLite size."""
-    if _supabase_configured():
+    """Return the PocketBase database table size (estimated) or local SQLite size."""
+    if _pocketbase_configured():
         try:
-            sb = _cloud_client()
-            # Query Supabase pg_total_relation_size for estimated table size
-            # Note: This requires a custom SQL query via Supabase RPC or direct postgres access
-            # For now, we'll get row count as a proxy for size
-            result = sb.table(TABLE).select("id", count="exact").execute()
-            row_count = result.count if hasattr(result, 'count') else 0
+            pb = _cloud_client()
+            # Get total count from PocketBase
+            result = pb.collection(TABLE).get_list(1, 1)
+            row_count = result.total_items if hasattr(result, 'total_items') else 0
             # Estimate: ~2KB per row average
             estimated_bytes = row_count * 2048
 
@@ -1195,9 +1198,9 @@ def api_db_size():
                 size_str = f"~{estimated_bytes / 1024:.1f} KB"
             else:
                 size_str = f"~{estimated_bytes / (1024 * 1024):.2f} MB"
-            return jsonify({"size": size_str + " (Supabase)", "bytes": estimated_bytes, "rows": row_count})
+            return jsonify({"size": size_str + " (PocketBase)", "bytes": estimated_bytes, "rows": row_count})
         except Exception as e:
-            # Fallback to local size if Supabase query fails
+            # Fallback to local size if PocketBase query fails
             pass
 
     # Local SQLite size
@@ -1216,24 +1219,24 @@ def api_db_size():
 
 @app.route("/api/sync/check-schema", methods=["GET"])
 def api_sync_check_schema():
-    """Check if Supabase database has all required columns."""
-    if not _supabase_configured():
-        return jsonify({"configured": False, "message": "Supabase not configured"})
+    """Check if PocketBase database has all required columns."""
+    if not _pocketbase_configured():
+        return jsonify({"configured": False, "message": "PocketBase not configured"})
 
     try:
-        sb = _cloud_client()
+        pb = _cloud_client()
         # Try to fetch one row to check available columns
-        result = sb.table(TABLE).select("*").limit(1).execute()
+        records = pb.collection(TABLE).get_list(1, 1)
 
         required_cols = {"sso_modeln", "ear", "bu", "application", "mchp_device", "project_schedule"}
-        if result.data:
-            existing_cols = set(result.data[0].keys())
+        if records.items:
+            existing_cols = set(vars(records.items[0]).keys())
             missing = required_cols - existing_cols
             if missing:
                 return jsonify({
                     "ok": False,
                     "missing_columns": list(missing),
-                    "message": f"Supabase schema needs update. Missing: {', '.join(missing)}"
+                    "message": f"PocketBase schema needs update. Missing: {', '.join(missing)}"
                 })
         return jsonify({"ok": True, "message": "Schema is up to date"})
     except Exception as e:
@@ -2877,21 +2880,21 @@ async function syncNow() {
     const testRes  = await fetch('/api/sync/test');
     const testData = await testRes.json();
 
-    if (!testData.has_supabase_lib) {
-      toast('❌ supabase library missing — run: pip install supabase'); return;
+    if (!testData.has_pocketbase_lib) {
+      toast('❌ pocketbase library missing — run: pip install pocketbase'); return;
     }
     if (!testData.configured) {
-      toast('⚙️ Supabase not configured — set URL and Key in .env'); return;
+      toast('⚙️ PocketBase not configured — set URL and Key in .env'); return;
     }
     if (!testData.online) {
       toast(`📴 Cannot reach ${testData.url} — check credentials or WiFi`); return;
     }
 
-    // Check if Supabase schema is up to date
+    // Check if PocketBase schema is up to date
     const schemaRes = await fetch('/api/sync/check-schema');
     const schemaData = await schemaRes.json();
     if (schemaData.ok === false && schemaData.missing_columns) {
-      if (confirm(`⚠️ Supabase database needs update!\n\nMissing columns: ${schemaData.missing_columns.join(', ')}\n\nPlease run the migration SQL in SUPABASE_MIGRATION.md\n\nContinue sync anyway? (May cause errors)`)) {
+      if (confirm(`⚠️ PocketBase database needs update!\n\nMissing columns: ${schemaData.missing_columns.join(', ')}\n\nPlease run the migration SQL in SUPABASE_MIGRATION.md\n\nContinue sync anyway? (May cause errors)`)) {
         // User chose to continue despite schema mismatch
       } else {
         return; // User cancelled
@@ -2909,12 +2912,12 @@ async function syncNow() {
       if (data.conflicts) msg.push(`⚠ ${data.conflicts} conflict(s)`);
       if (data.errors && data.errors.length) {
         console.error('Sync errors:', data.errors);
-        // Check if errors are due to missing Supabase columns
+        // Check if errors are due to missing PocketBase columns
         const schemaError = data.errors.some(e =>
           e.includes('column') || e.includes('does not exist') || e.includes('unknown')
         );
         if (schemaError) {
-          msg.push(`⚠️ Schema mismatch - update Supabase (see SUPABASE_MIGRATION.md)`);
+          msg.push(`⚠️ Schema mismatch - update PocketBase (see SUPABASE_MIGRATION.md)`);
         } else {
           msg.push(`${data.errors.length} error(s)`);
         }
@@ -3077,16 +3080,16 @@ if __name__ == "__main__":
     print(f"\n  Work Log Journal - http://localhost:{port}")
     print(f"  Local network:     http://<your-ip>:{port}")
     print(f"  .env file:         {'FOUND [OK] ' + str(env_file) if env_file.exists() else 'NOT FOUND - create .env next to app.py'}")
-    print(f"  SUPABASE_URL:      {SUPABASE_URL[:40] + '...' if SUPABASE_URL else '(not set)'}")
-    print(f"  SUPABASE_KEY:      {'set [OK]' if SUPABASE_KEY else '(not set)'}")
-    print(f"  supabase library:  {'installed [OK]' if HAS_SUPABASE else 'MISSING - run: pip install supabase'}")
-    if HAS_SUPABASE and SUPABASE_URL and SUPABASE_KEY:
-        print(f"  DB:                Supabase (cloud) [OK]")
+    print(f"  POCKETBASE_URL:      {POCKETBASE_URL[:40] + '...' if POCKETBASE_URL else '(not set)'}")
+    print(f"  POCKETBASE_TOKEN:      {'set [OK]' if POCKETBASE_TOKEN else '(not set)'}")
+    print(f"  pocketbase library:  {'installed [OK]' if HAS_POCKETBASE else 'MISSING - run: pip install pocketbase'}")
+    if HAS_POCKETBASE and POCKETBASE_URL and POCKETBASE_TOKEN:
+        print(f"  DB:                PocketBase (cloud) [OK]")
     else:
         reasons = []
-        if not HAS_SUPABASE:   reasons.append("supabase not installed")
-        if not SUPABASE_URL:   reasons.append("SUPABASE_URL missing")
-        if not SUPABASE_KEY:   reasons.append("SUPABASE_KEY missing")
+        if not HAS_POCKETBASE:   reasons.append("pocketbase not installed")
+        if not POCKETBASE_URL:   reasons.append("POCKETBASE_URL missing")
+        if not POCKETBASE_TOKEN:   reasons.append("POCKETBASE_TOKEN missing")
         print(f"  DB:                SQLite (local) - {', '.join(reasons)}")
     print()
     app.run(host=host, port=port, debug=False)

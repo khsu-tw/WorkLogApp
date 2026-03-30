@@ -52,7 +52,7 @@ RED      = "#DC2626"
 # ─────────────────────────────────────────────────────────────────────────────
 class SetupWizard(tk.Toplevel):
     """
-    Modal dialog that asks the user for Supabase credentials.
+    Modal dialog that asks the user for PocketBase credentials.
     Shown on first launch or when .env is missing / invalid.
     """
     def __init__(self, parent, existing: dict):
@@ -82,36 +82,35 @@ class SetupWizard(tk.Toplevel):
         body.pack(fill="both", expand=True)
 
         # Intro
-        intro = ("Welcome!  Work Log can store data in the cloud using Supabase,\n"
+        intro = ("Welcome!  Work Log can store data in the cloud using PocketBase,\n"
                  "or locally on this computer.\n\n"
-                 "Leave both fields blank to use local storage only.")
+                 "Leave URL blank to use local storage only.")
         tk.Label(body, text=intro, font=("Arial", 9), bg=LIGHT, fg="#374151",
                  justify="left", anchor="w").pack(fill="x", pady=(0, 16))
 
-        # Supabase URL
-        tk.Label(body, text="Supabase URL", font=("Arial", 9, "bold"),
+        # PocketBase URL
+        tk.Label(body, text="PocketBase URL", font=("Arial", 9, "bold"),
                  bg=LIGHT, fg=DARK, anchor="w").pack(fill="x")
         self._url = ttk.Entry(body, font=("Arial", 10), width=52)
-        self._url.insert(0, existing.get("SUPABASE_URL", ""))
+        self._url.insert(0, existing.get("POCKETBASE_URL", "http://127.0.0.1:8090"))
         self._url.pack(fill="x", pady=(2, 10))
-        tk.Label(body, text="e.g. https://xxxx.supabase.co",
+        tk.Label(body, text="e.g. http://127.0.0.1:8090 or https://your-pocketbase-server.com",
                  font=("Arial", 8), bg=LIGHT, fg="#6B7280", anchor="w").pack(fill="x")
 
-        # Supabase Key
-        tk.Label(body, text="Supabase Anon Key", font=("Arial", 9, "bold"),
+        # PocketBase Token (Optional)
+        tk.Label(body, text="PocketBase Token (Optional)", font=("Arial", 9, "bold"),
                  bg=LIGHT, fg=DARK, anchor="w").pack(fill="x", pady=(12, 0))
         self._key = ttk.Entry(body, font=("Arial", 10), width=52, show="•")
-        self._key.insert(0, existing.get("SUPABASE_KEY", ""))
+        self._key.insert(0, existing.get("POCKETBASE_TOKEN", ""))
         self._key.pack(fill="x", pady=(2, 4))
         tk.Label(body,
-                 text="Generate at: id.atlassian.com/manage-profile/security/api-tokens  "
-                      "(Project Settings → API → anon public)",
+                 text="Generate in: PocketBase Admin UI → Settings → API Keys",
                  font=("Arial", 8), bg=LIGHT, fg="#6B7280",
                  anchor="w", wraplength=460, justify="left").pack(fill="x")
 
         # Show / hide key
         self._show_key = tk.BooleanVar(value=False)
-        ttk.Checkbutton(body, text="Show key", variable=self._show_key,
+        ttk.Checkbutton(body, text="Show token", variable=self._show_key,
                         command=self._toggle_key).pack(anchor="w", pady=(2, 0))
 
         # Separator
@@ -136,13 +135,13 @@ class SetupWizard(tk.Toplevel):
         self._key.config(show="" if self._show_key.get() else "•")
 
     def _use_local(self):
-        self.result = {"SUPABASE_URL": "", "SUPABASE_KEY": ""}
+        self.result = {"POCKETBASE_URL": "", "POCKETBASE_TOKEN": ""}
         self.destroy()
 
     def _save(self):
         self.result = {
-            "SUPABASE_URL": self._url.get().strip(),
-            "SUPABASE_KEY": self._key.get().strip(),
+            "POCKETBASE_URL": self._url.get().strip(),
+            "POCKETBASE_TOKEN": self._key.get().strip(),
         }
         self.destroy()
 

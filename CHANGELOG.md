@@ -5,6 +5,17 @@ Format: [Semantic Versioning](https://semver.org)
 
 ---
 
+## [v0.9.8] — 2026-03-30
+
+- 將v0.9.6程式碼從Supabase完整遷移至PocketBase
+- 修改Worklogs的欄位寬度與Task Summary相同寬度
+- 縮減MCHP Device欄位寬度並允許自動換行
+- 程式右上角顯示版本訊息 by Keynes Hsu
+- 抓取PocketBase中Database 的Size，並於版面右上方顯示
+- 顯示即時資料庫Egress的流量。
+- 增加PDF輸出資料項選擇
+- 資料庫sync頻率設定為每3分鐘或是當有資料變更改為推送(push)至雲端資料庫進行更新
+
 ## [v0.9.7] — 2026-03-29
 
 - Full iOS/Android native app via Capacitor or React Native

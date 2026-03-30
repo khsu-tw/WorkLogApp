@@ -1,6 +1,7 @@
 flask>=3.0
-supabase>=2.3
+pocketbase>=0.15.0
 python-docx>=0.8.11
+requests>=2.31.0
 Pillow>=10.0
 python-dotenv>=1.0
 openpyxl>=3.1.0
