@@ -47,6 +47,14 @@ try:
 except ImportError:
     HAS_POCKETBASE = False
 
+# ── Optional cloud DB (PostgreSQL) - v1.0.1 ─────────────────────────────────
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    HAS_POSTGRES = True
+except ImportError:
+    HAS_POSTGRES = False
+
 import requests  # For PocketBase health check
 
 # ── Optional Word export ─────────────────────────────────────────────────────
@@ -92,6 +100,8 @@ app.secret_key = os.environ.get("SECRET_KEY", "worklog-dev-key-change-in-prod")
 # ─────────────────────────────────────────────────────────────────────────────
 POCKETBASE_URL = os.environ.get("POCKETBASE_URL", "http://127.0.0.1:8090")
 POCKETBASE_TOKEN = os.environ.get("POCKETBASE_TOKEN", "")
+# PostgreSQL configuration (v1.0.1 - alternative to PocketBase)
+POSTGRES_URL = os.environ.get("POSTGRES_URL", "")  # Format: postgresql://user:pass@host:port/db
 TABLE = "worklog"
 
 # Resolve DB path relative to the executable (works both packaged and in dev)
@@ -158,6 +168,7 @@ class LocalDB:
                 week TEXT, due_date TEXT, customer TEXT, project_name TEXT,
                 sso_modeln TEXT, ear TEXT, application TEXT, bu TEXT,
                 task_summary TEXT, mchp_device TEXT, project_schedule TEXT,
+                todo_content TEXT, todo_due_date TEXT,
                 status TEXT, category TEXT,
                 worklogs TEXT, create_date TEXT, last_update TEXT,
                 archive TEXT DEFAULT 'No', record_hash TEXT,
@@ -180,6 +191,7 @@ class LocalDB:
                 ("sync_status","TEXT"),("local_updated_at","TEXT"),
                 ("sso_modeln","TEXT"),("ear","TEXT"),("application","TEXT"),("bu","TEXT"),
                 ("project_schedule","TEXT"),
+                ("todo_content","TEXT"),("todo_due_date","TEXT"),
             ]:
                 if col not in cols:
                     c.execute(f"ALTER TABLE worklog ADD COLUMN {col} {dtype}")
@@ -201,6 +213,8 @@ class LocalDB:
                 if val:
                     if col in ("customer","project_name"):
                         clauses.append(f"{col} LIKE ?"); params.append(f"%{val}%")
+                    elif col == "archive":
+                        clauses.append(f"IFNULL({col}, 'No')=?"); params.append(val)
                     else:
                         clauses.append(f"{col}=?"); params.append(val)
             if clauses:
@@ -226,7 +240,10 @@ class LocalDB:
             cur = c.execute(f"INSERT INTO worklog ({cols}) VALUES ({phs})",
                             list(data.values()))
             c.commit()
-            return {**data, "id": cur.lastrowid}
+            result = {**data, "id": cur.lastrowid}
+            # Trigger immediate sync on data change
+            _trigger_sync()
+            return result
         except Exception as e:
             c.rollback(); raise e
         finally:
@@ -242,6 +259,8 @@ class LocalDB:
             c.execute(f"UPDATE worklog SET {sets} WHERE id=?",
                       list(data.values()) + [row_id])
             c.commit()
+            # Trigger immediate sync on data change
+            _trigger_sync()
         except Exception as e:
             c.rollback(); raise e
         finally:
@@ -254,6 +273,8 @@ class LocalDB:
         try:
             c.execute("UPDATE worklog SET sync_status='deleted' WHERE id=?", (row_id,))
             c.commit()
+            # Trigger immediate sync on data change
+            _trigger_sync()
         finally:
             c.close()
 
@@ -396,15 +417,19 @@ def _has_local_data() -> bool:
 
 # ── Cloud connectivity check ──────────────────────────────────────────────────
 def _is_online() -> bool:
-    """True when PocketBase is reachable."""
-    if not _pocketbase_configured():
-        return False
-    url = os.environ.get("POCKETBASE_URL", POCKETBASE_URL)
-    try:
-        resp = requests.get(f"{url.rstrip('/')}/api/health", timeout=3)
-        return resp.status_code == 200
-    except Exception:
-        return False
+    """True when cloud database (PocketBase or PostgreSQL) is reachable."""
+    # Check PocketBase first
+    if _pocketbase_configured():
+        url = os.environ.get("POCKETBASE_URL", POCKETBASE_URL)
+        try:
+            resp = requests.get(f"{url.rstrip('/')}/api/health", timeout=3)
+            if resp.status_code == 200:
+                return True
+        except Exception:
+            pass
+    if _postgres_configured():
+        return _postgres_online()
+    return False
 
 
 def _cloud_client():
@@ -425,15 +450,48 @@ def _pocketbase_configured() -> bool:
     )
 
 
+# ── PostgreSQL support ────────────────────────────────────────────────────────
+def _postgres_configured() -> bool:
+    """Check if PostgreSQL is configured."""
+    return bool(HAS_POSTGRES and os.environ.get("POSTGRES_URL", POSTGRES_URL))
+
+
+def _postgres_client():
+    """Create PostgreSQL connection."""
+    url = os.environ.get("POSTGRES_URL", POSTGRES_URL)
+    if not url:
+        return None
+    try:
+        conn = psycopg2.connect(url, cursor_factory=RealDictCursor, connect_timeout=5)
+        return conn
+    except Exception:
+        return None
+
+
+def _postgres_online() -> bool:
+    """Check if PostgreSQL is reachable."""
+    if not _postgres_configured():
+        return False
+    try:
+        conn = _postgres_client()
+        if conn:
+            conn.close()
+            return True
+    except Exception:
+        pass
+    return False
+
+
 # ── Sync engine ───────────────────────────────────────────────────────────────
 class SyncEngine:
     """
     Background worker:
-      • Every 30 s: checks connectivity, pushes pending rows, pulls remote changes.
+      • Every 3 min: checks connectivity, pushes pending rows, pulls remote changes.
+      • On data change: immediate push to cloud.
       • Conflict = local pending AND cloud version has a newer last_update.
         → stores conflict, flags row; user resolves via /api/sync/conflicts.
     """
-    INTERVAL = 30    # seconds between sync attempts
+    INTERVAL = 180   # seconds between sync attempts (3 minutes)
 
     def __init__(self):
         self._stop   = _threading.Event()
@@ -470,13 +528,17 @@ class SyncEngine:
         # Give Flask a moment to finish starting
         _time.sleep(2)
         if _is_online():
-            # Always create a backup of cloud data when online
-            self._create_cloud_backup()
+            # Always create a backup of cloud data when online (PocketBase only)
+            if not _postgres_configured():
+                self._create_cloud_backup()
             if not _has_local_data():
                 report = {"pushed": 0, "pulled": 0, "conflicts": 0, "errors": []}
                 with _sync_lock:
                     try:
-                        self._pull(report)
+                        if _postgres_configured():
+                            self._pull_postgres(report)
+                        else:
+                            self._pull(report)
                         if report["pulled"]:
                             self._status["last_sync"] = datetime.datetime.now().strftime(
                                 "%Y-%m-%d %H:%M:%S")
@@ -508,8 +570,12 @@ class SyncEngine:
 
         with _sync_lock:
             try:
-                self._push(report)
-                self._pull(report)
+                if _postgres_configured():
+                    self._push_postgres(report)
+                    self._pull_postgres(report)
+                else:
+                    self._push(report)
+                    self._pull(report)
                 self._status["last_sync"] = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
                 self._status["pending"]   = 0
@@ -545,7 +611,9 @@ class SyncEngine:
             payload = {k: v for k, v in row.items()
                        if k not in ("id","cloud_id","sync_status","local_updated_at")}
 
-            # Note: Ensure your PocketBase collection has been configured with the required fields
+            # Map local "archive" → PocketBase "archieved"
+            if "archive" in payload:
+                payload["archieved"] = payload.pop("archive")
 
             if cloud_id:
                 # Check for conflict: compare timestamps (use local_updated_at for precision)
@@ -604,6 +672,9 @@ class SyncEngine:
         row.setdefault("sso_modeln", "")
         row.setdefault("application", "")
         row.setdefault("project_schedule", "")
+        row.setdefault("todo_content", "")
+        row.setdefault("todo_due_date", "")
+        row.setdefault("archive", "No")
         return row
 
     def _pb_record_to_dict(self, record) -> dict:
@@ -611,9 +682,10 @@ class SyncEngine:
         result = {}
         for field in ["id", "week", "due_date", "customer", "project_name", "sso_modeln",
                       "ear", "application", "bu", "task_summary", "mchp_device",
-                      "project_schedule", "status", "category", "worklogs", "create_date",
-                      "last_update", "archive", "record_hash", "created", "updated"]:
+                      "project_schedule", "todo_content", "todo_due_date", "status", "category", "worklogs", "create_date",
+                      "last_update", "record_hash", "created", "updated"]:
             result[field] = getattr(record, field, None)
+        result["archive"] = getattr(record, "archieved", None) or "No"
         return result
 
     def _pull(self, report: dict):
@@ -667,7 +739,173 @@ class SyncEngine:
                     payload = {k: v for k, v in payload.items() if k in valid_cols}
                     sets = ", ".join([f"{k}=?" for k in payload])
                     c = db._conn()
-                    c.execute(f"UPDATE worklog SET {sets} WHERE id=?",
+                    # Guard: don't overwrite a soft-deleted record (race with concurrent delete)
+                    c.execute(f"UPDATE worklog SET {sets} WHERE id=? AND sync_status != 'deleted'",
+                              list(payload.values()) + [local["id"]])
+                    c.commit(); c.close()
+                    report["pulled"] += 1
+
+    # ── PostgreSQL sync methods ───────────────────────────────────────────────
+
+    _PG_COLS = frozenset({
+        "week", "due_date", "customer", "project_name", "sso_modeln",
+        "ear", "application", "bu", "task_summary", "mchp_device",
+        "project_schedule", "todo_content", "todo_due_date",
+        "status", "category", "worklogs", "create_date", "last_update",
+        "archived", "record_hash",
+    })
+
+    _LOCAL_COLS = frozenset({
+        "week", "due_date", "customer", "project_name", "sso_modeln",
+        "ear", "application", "bu", "task_summary", "mchp_device",
+        "project_schedule", "todo_content", "todo_due_date",
+        "status", "category", "worklogs", "create_date", "last_update",
+        "archive", "record_hash", "cloud_id", "sync_status", "local_updated_at",
+    })
+
+    def _push_postgres(self, report: dict):
+        """Push pending local rows to PostgreSQL."""
+        db = _get_local_db()
+        pending = db.pending_rows()
+        if not pending:
+            return
+
+        conn = _postgres_client()
+        if not conn:
+            report["errors"].append("PostgreSQL connection failed")
+            return
+
+        try:
+            cur = conn.cursor()
+
+            for row in pending:
+                local_id = row["id"]
+                cloud_id = row.get("cloud_id")
+
+                if row["sync_status"] == "deleted":
+                    pg_deleted = True
+                    if cloud_id:
+                        try:
+                            pg_id = int(cloud_id)
+                            cur.execute("DELETE FROM worklog WHERE id=%s", (pg_id,))
+                            conn.commit()
+                        except (ValueError, TypeError):
+                            pass  # Non-integer cloud_id (not a PG record) — delete locally only
+                        except Exception as e:
+                            conn.rollback()
+                            report["errors"].append(f"pg delete {local_id}: {e}")
+                            pg_deleted = False
+                    if pg_deleted:
+                        c = db._conn()
+                        c.execute("DELETE FROM worklog WHERE id=?", (local_id,))
+                        c.commit(); c.close()
+                        report["pushed"] += 1
+                    continue
+
+                # Build payload: map local "archive" → pg "archived"
+                payload = {}
+                for k, v in row.items():
+                    if k in ("id", "cloud_id", "sync_status", "local_updated_at"):
+                        continue
+                    if k == "archive":
+                        payload["archived"] = v
+                    elif k in self._PG_COLS:
+                        payload[k] = v
+
+                if cloud_id:
+                    # Conflict check
+                    try:
+                        cur.execute("SELECT last_update FROM worklog WHERE id=%s", (int(cloud_id),))
+                        pg_row = cur.fetchone()
+                        if pg_row:
+                            cloud_lu = pg_row["last_update"] or ""
+                            local_lu = row.get("last_update") or ""
+                            if cloud_lu and local_lu and cloud_lu > local_lu:
+                                cur.execute("SELECT * FROM worklog WHERE id=%s", (int(cloud_id),))
+                                cloud_data = dict(cur.fetchone())
+                                cloud_data["archive"] = cloud_data.pop("archived", "No") or "No"
+                                db.mark_conflict(local_id, cloud_data)
+                                report["conflicts"] += 1
+                                continue
+                    except Exception:
+                        pass
+                    try:
+                        sets = ", ".join([f"{k}=%s" for k in payload])
+                        vals = list(payload.values()) + [int(cloud_id)]
+                        cur.execute(f"UPDATE worklog SET {sets} WHERE id=%s", vals)
+                        conn.commit()
+                        db.mark_synced(local_id, cloud_id)
+                        report["pushed"] += 1
+                    except Exception as e:
+                        conn.rollback()
+                        report["errors"].append(f"pg update {local_id}: {e}")
+                else:
+                    try:
+                        cols = ", ".join(payload.keys())
+                        phs  = ", ".join(["%s"] * len(payload))
+                        cur.execute(
+                            f"INSERT INTO worklog ({cols}) VALUES ({phs}) RETURNING id",
+                            list(payload.values())
+                        )
+                        conn.commit()
+                        new_id = cur.fetchone()["id"]
+                        db.mark_synced(local_id, str(new_id))
+                        report["pushed"] += 1
+                    except Exception as e:
+                        conn.rollback()
+                        report["errors"].append(f"pg insert {local_id}: {e}")
+        finally:
+            conn.close()
+
+    def _pull_postgres(self, report: dict):
+        """Pull all PostgreSQL rows into local cache."""
+        db = _get_local_db()
+
+        conn = _postgres_client()
+        if not conn:
+            report["errors"].append("PostgreSQL connection failed")
+            return
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM worklog")
+            cloud_rows = [dict(r) for r in cur.fetchall()]
+        except Exception as e:
+            report["errors"].append(f"pg pull fetch: {e}")
+            return
+        finally:
+            conn.close()
+
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        for crow in cloud_rows:
+            cloud_id = str(crow["id"])
+            # Map pg "archived" → local "archive"
+            crow["archive"] = crow.pop("archived", "No") or "No"
+            for col in ("id", "created_at"):
+                crow.pop(col, None)
+
+            local = db.find_by_cloud_id(cloud_id)
+            if local is None:
+                payload = {k: v for k, v in crow.items() if k in self._LOCAL_COLS}
+                payload["cloud_id"]        = cloud_id
+                payload["sync_status"]     = "synced"
+                payload["local_updated_at"] = now_iso
+                try:
+                    db.insert(payload)
+                    report["pulled"] += 1
+                except Exception as e:
+                    report["errors"].append(f"pg pull insert {cloud_id}: {e}")
+            elif local["sync_status"] == "synced":
+                cloud_lu = crow.get("last_update") or ""
+                local_lu = local.get("last_update") or ""
+                if cloud_lu and cloud_lu > local_lu:
+                    payload = {k: v for k, v in crow.items() if k in self._LOCAL_COLS}
+                    payload["cloud_id"]        = cloud_id
+                    payload["sync_status"]     = "synced"
+                    payload["local_updated_at"] = now_iso
+                    sets = ", ".join([f"{k}=?" for k in payload])
+                    c = db._conn()
+                    # Guard: don't overwrite a soft-deleted record (race with concurrent delete)
+                    c.execute(f"UPDATE worklog SET {sets} WHERE id=? AND sync_status != 'deleted'",
                               list(payload.values()) + [local["id"]])
                     c.commit(); c.close()
                     report["pulled"] += 1
@@ -675,6 +913,14 @@ class SyncEngine:
 
 # ── Global sync engine — always starts; silently skips cycles when offline ────
 _sync_engine = SyncEngine()
+
+def _trigger_sync():
+    """Trigger an immediate background sync on data change (non-blocking).
+    Always spawns a thread; sync_now() handles the online check internally.
+    Only spawns if a cloud backend is configured (avoids noise in local-only mode).
+    """
+    if _postgres_configured() or _pocketbase_configured():
+        _threading.Thread(target=_sync_engine.sync_now, daemon=True).start()
 
 def get_db():
     """Always return the local DB. Sync runs in background."""
@@ -825,14 +1071,35 @@ def api_sync_status():
 @app.route("/api/sync/test", methods=["GET"])
 def api_sync_test():
     """Verify connectivity and return detailed diagnostics."""
+    if _postgres_configured():
+        url = os.environ.get("POSTGRES_URL", POSTGRES_URL)
+        pg_error = None
+        online = False
+        try:
+            conn = psycopg2.connect(url, cursor_factory=RealDictCursor,
+                                    connect_timeout=5)
+            conn.close()
+            online = True
+        except Exception as e:
+            pg_error = str(e).split("\n")[0]  # first line only
+        short_url = url[:60] + "…" if len(url) > 60 else url
+        return jsonify({
+            "configured":        True,
+            "online":            online,
+            "url":               short_url,
+            "has_pocketbase_lib": HAS_POCKETBASE,
+            "backend":           "postgres",
+            "error":             pg_error,
+        })
     configured = _pocketbase_configured()
     online     = _is_online() if configured else False
     url        = os.environ.get("POCKETBASE_URL", POCKETBASE_URL)
     return jsonify({
-        "configured": configured,
-        "online":     online,
-        "url":        url[:40] + "…" if len(url) > 40 else url,
+        "configured":        configured,
+        "online":            online,
+        "url":               url[:40] + "…" if len(url) > 40 else url,
         "has_pocketbase_lib": HAS_POCKETBASE,
+        "backend":           "pocketbase",
     })
 
 @app.route("/api/sync/now", methods=["POST"])
@@ -869,7 +1136,7 @@ def api_config():
         "status_options":   STATUS_OPTIONS,
         "category_options": CATEGORY_OPTIONS,
         "today":            today_str(),
-        "db_type":          "PocketBase + Local Cache" if _pocketbase_configured() else "SQLite (local only)",
+        "db_type":          "PostgreSQL ☁" if _postgres_configured() else ("PocketBase + Local Cache" if _pocketbase_configured() else "SQLite (local only)"),
         "has_docx":         HAS_DOCX,
         "version":          APP_VERSION,
         "sync":             sync,
@@ -963,14 +1230,188 @@ def api_export_word():
         return jsonify({"error": str(e)}), 500
 
 
+def _export_excel_wlr(rows):
+    """Export WLR format (v0.9.5 comprehensive format)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "WorkLog Report"
+
+    rows = [r for r in rows if (r.get("archive") or "No") != "Yes"]
+
+    if not rows:
+        return jsonify({"error": "No records to export (all selected records are archived)"}), 400
+
+    # Column mapping: DB field -> Excel header
+    columns = [
+        ("customer", "OEM/ODM/OBM/Disti"),
+        ("sso_modeln", "SSO#"),
+        ("project_name", "Project Name"),
+        ("application", "Application"),
+        ("bu", "BU"),
+        ("mchp_device", "Microchip Devices"),
+        ("task_summary", "Status/Update"),
+        ("ear", "EAR(K$)"),
+        ("project_schedule", "Timeline"),
+    ]
+
+    # Header style
+    header_fill = PatternFill(start_color="1E3A5F", end_color="1E3A5F", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    thin_border = Border(
+        left=Side(style='thin'), right=Side(style='thin'),
+        top=Side(style='thin'), bottom=Side(style='thin')
+    )
+
+    # Write headers
+    for col_idx, (_, header) in enumerate(columns, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.border = thin_border
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    # Write data
+    for row_idx, row in enumerate(rows, 2):
+        for col_idx, (field, _) in enumerate(columns, 1):
+            value = row.get(field, "") or ""
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.border = thin_border
+            cell.alignment = Alignment(vertical='top', wrap_text=True)
+
+    # Auto-adjust column widths
+    for col_idx, (_, header) in enumerate(columns, 1):
+        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 15
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    fname = f"WorkLog_WLR_{datetime.date.today().strftime('%Y%m%d')}.xlsx"
+    return send_file(buf, as_attachment=True, download_name=fname,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+def _export_excel_todo(rows, date_filter):
+    """Export To-Do format with checkboxes and date filtering."""
+    from datetime import datetime as dt, timedelta
+
+    # Filter: must have non-empty todo_due_date
+    filtered_rows = []
+    for row in rows:
+        due_date = (row.get("todo_due_date") or "").strip()
+        if not due_date:
+            continue
+
+        # Apply Week+1 filter if requested
+        if date_filter == "week_plus_1":
+            try:
+                # Parse MM-DD-YYYY format
+                parts = due_date.split("-")
+                if len(parts) == 3:
+                    month, day, year = int(parts[0]), int(parts[1]), int(parts[2])
+                    due_date_obj = dt(year, month, day)
+                    today = dt.now()
+                    week_from_now = today + timedelta(days=7)
+
+                    if today <= due_date_obj <= week_from_now:
+                        filtered_rows.append(row)
+            except (ValueError, IndexError):
+                continue
+        else:
+            filtered_rows.append(row)
+
+    if not filtered_rows:
+        return jsonify({"error": "No To-Do records with due dates found"}), 400
+
+    # Sort by due date ascending
+    def parse_date_for_sort(row):
+        due_date = row.get("todo_due_date") or ""
+        try:
+            parts = due_date.split("-")
+            if len(parts) == 3:
+                return dt(int(parts[2]), int(parts[0]), int(parts[1]))
+        except:
+            pass
+        return dt(1970, 1, 1)
+
+    filtered_rows.sort(key=parse_date_for_sort)
+
+    # Create workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "To-Do List"
+
+    # Columns: Completed (☐), Customer, Project Name, Due Date, To-Do
+    columns = [
+        ("completed", "Completed"),
+        ("customer", "Customer"),
+        ("project_name", "Project Name"),
+        ("todo_due_date", "Due Date"),
+        ("todo_content", "To-Do"),
+    ]
+
+    # Header styling
+    header_fill = PatternFill(start_color="1E3A5F", end_color="1E3A5F", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    thin_border = Border(
+        left=Side(style='thin'), right=Side(style='thin'),
+        top=Side(style='thin'), bottom=Side(style='thin')
+    )
+
+    # Write headers
+    for col_idx, (_, header) in enumerate(columns, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.border = thin_border
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    # Write data
+    for row_idx, row in enumerate(filtered_rows, 2):
+        for col_idx, (field, _) in enumerate(columns, 1):
+            if field == "completed":
+                value = "☐"  # Unicode unchecked box
+            else:
+                value = row.get(field, "") or ""
+
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.border = thin_border
+
+            if field == "completed":
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.font = Font(size=14)  # Larger checkbox
+            elif field == "todo_content":
+                cell.alignment = Alignment(vertical='top', wrap_text=True)
+            else:
+                cell.alignment = Alignment(vertical='center')
+
+    # Column widths
+    ws.column_dimensions['A'].width = 10   # Completed
+    ws.column_dimensions['B'].width = 20   # Customer
+    ws.column_dimensions['C'].width = 25   # Project Name
+    ws.column_dimensions['D'].width = 12   # Due Date
+    ws.column_dimensions['E'].width = 40   # To-Do
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    fname = f"WorkLog_ToDo_{datetime.date.today().strftime('%Y%m%d')}.xlsx"
+    return send_file(buf, as_attachment=True, download_name=fname,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
 @app.route("/api/export/excel", methods=["POST"])
 def api_export_excel():
-    """Export selected records to Excel with column mapping."""
+    """Export selected records to Excel with format options."""
     if not HAS_EXCEL:
         return jsonify({"error": "openpyxl not installed — run: pip install openpyxl"}), 500
     try:
         body = request.json or {}
         ids = body.get("ids", [])
+        export_format = body.get("format", "WLR")
+        date_filter = body.get("date_filter", "all")
+
         all_rows = get_db().fetch_all()
 
         if ids:
@@ -982,58 +1423,11 @@ def api_export_excel():
         if not rows:
             return jsonify({"error": "No records to export"}), 400
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "WorkLog"
+        if export_format == "TODO":
+            return _export_excel_todo(rows, date_filter)
+        else:
+            return _export_excel_wlr(rows)
 
-        # Column mapping: DB field -> Excel header (only specified columns per CHANGELOG)
-        columns = [
-            ("customer", "OEM/ODM/OBM/Disti"),
-            ("sso_modeln", "SSO#"),
-            ("project_name", "Project Name"),
-            ("application", "Application"),
-            ("bu", "BU"),
-            ("mchp_device", "Microchip Devices"),
-            ("task_summary", "Status/Update"),
-            ("ear", "EAR(K$)"),
-            ("project_schedule", "Timeline"),
-        ]
-
-        # Header style
-        header_fill = PatternFill(start_color="1E3A5F", end_color="1E3A5F", fill_type="solid")
-        header_font = Font(bold=True, color="FFFFFF")
-        thin_border = Border(
-            left=Side(style='thin'), right=Side(style='thin'),
-            top=Side(style='thin'), bottom=Side(style='thin')
-        )
-
-        # Write headers
-        for col_idx, (_, header) in enumerate(columns, 1):
-            cell = ws.cell(row=1, column=col_idx, value=header)
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.border = thin_border
-            cell.alignment = Alignment(horizontal='center', vertical='center')
-
-        # Write data
-        for row_idx, row in enumerate(rows, 2):
-            for col_idx, (field, _) in enumerate(columns, 1):
-                value = row.get(field, "") or ""
-                cell = ws.cell(row=row_idx, column=col_idx, value=value)
-                cell.border = thin_border
-                cell.alignment = Alignment(vertical='top', wrap_text=True)
-
-        # Auto-adjust column widths
-        for col_idx, (_, header) in enumerate(columns, 1):
-            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 15
-
-        buf = io.BytesIO()
-        wb.save(buf)
-        buf.seek(0)
-
-        fname = f"WorkLog_{datetime.date.today().strftime('%Y%m%d')}.xlsx"
-        return send_file(buf, as_attachment=True, download_name=fname,
-                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     except Exception as e:
         app.logger.error(f"Excel export error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
@@ -1058,8 +1452,6 @@ def api_export_pdf():
         if not rows:
             return jsonify({"error": "No records to export"}), 400
 
-        # v0.9.6: A4 Landscape, auto-adjust format, fit data to page width
-        # Allow Task Summary and Worklogs multi-line wrapping
         pdf = FPDF(orientation='L', unit='mm', format='A4')
         pdf.set_auto_page_break(auto=True, margin=10)
         pdf.add_page()
@@ -1228,7 +1620,8 @@ def api_sync_check_schema():
         # Try to fetch one row to check available columns
         records = pb.collection(TABLE).get_list(1, 1)
 
-        required_cols = {"sso_modeln", "ear", "bu", "application", "mchp_device", "project_schedule"}
+        required_cols = {"sso_modeln", "ear", "bu", "application", "mchp_device", "project_schedule",
+                         "todo_content", "todo_due_date"}
         if records.items:
             existing_cols = set(vars(records.items[0]).keys())
             missing = required_cols - existing_cols
@@ -1451,19 +1844,26 @@ def _build_word_doc(all_rows, out_buf, target_year=None, target_week=None):
     for row in all_rows:
         wl = row.get("worklogs") or ""
         if target_year and target_week:
+            # Filter entries for specific week
             entries = [(dt, c) for dt, c in parse_worklog_entries(wl)
                        if dt.isocalendar()[:2] == (target_year, target_week)]
+            # Only include records that have entries in the target week
+            if not entries:
+                continue
         else:
             entries = parse_worklog_entries(wl)
             if not entries and wl.strip():
                 entries = [(datetime.datetime(1970, 1, 1), wl.strip())]
-        if entries or (row.get("task_summary") or "").strip():
-            report_rows.append({
-                "customer":     row.get("customer") or "",
-                "project_name": row.get("project_name") or "",
-                "task_summary": row.get("task_summary") or "",
-                "entries":      sorted(entries, key=lambda x: x[0]),
-            })
+            # For "all records", include if has entries or task_summary
+            if not entries and not (row.get("task_summary") or "").strip():
+                continue
+
+        report_rows.append({
+            "customer":     row.get("customer") or "",
+            "project_name": row.get("project_name") or "",
+            "task_summary": row.get("task_summary") or "",
+            "entries":      sorted(entries, key=lambda x: x[0]),
+        })
     report_rows.sort(key=lambda r: (r["customer"].lower(), r["project_name"].lower()))
 
     for idx, rec in enumerate(report_rows):
@@ -1618,7 +2018,8 @@ HTML = r"""<!DOCTYPE html>
   tbody tr.selected { background:color-mix(in srgb, var(--accent) 15%, var(--bg)); }
   tbody td { padding:7px 10px; vertical-align:top; max-width:260px;
              overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  tbody td.wl-cell { white-space:normal; max-height:60px; overflow:hidden; max-width:400px; }
+  tbody td.wl-cell { white-space:normal; max-height:60px; overflow:hidden; max-width:260px; }
+  tbody td.mchp-device-cell { max-width:150px; white-space:normal; word-wrap:break-word; }
   .badge { display:inline-block; padding:2px 8px; border-radius:20px;
            font-size:10px; font-weight:600; }
   .badge-done   { background:color-mix(in srgb,var(--green) 20%,transparent);  color:var(--green); }
@@ -1685,11 +2086,14 @@ HTML = r"""<!DOCTYPE html>
               background:rgba(0,0,0,.88); align-items:center;
               justify-content:center; cursor:zoom-out; }
   #lightbox.open { display:flex; }
-  #lightbox-img { max-width:90vw; max-height:90vh; border-radius:8px;
+  #lightbox-container { position:relative; width:600px; height:450px;
+                        min-width:200px; min-height:150px;
+                        max-width:95vw; max-height:95vh;
+                        resize:both; overflow:auto;
+                        border-radius:8px; box-shadow:0 8px 48px rgba(0,0,0,.7); }
+  #lightbox-img { width:100%; height:100%; border-radius:8px;
                   object-fit:contain; cursor:default;
-                  box-shadow:0 8px 48px rgba(0,0,0,.7);
-                  /* drag-to-resize handle at bottom-right */
-                  resize:both; overflow:hidden; }
+                  display:block; }
   #lightbox-close { position:fixed; top:16px; right:20px; background:rgba(255,255,255,.15);
                     border:none; color:#fff; font-size:22px; width:36px; height:36px;
                     border-radius:50%; cursor:pointer; line-height:1;
@@ -1774,7 +2178,8 @@ HTML = r"""<!DOCTYPE html>
     <button class="btn btn-ghost"  onclick="exportPdf()">📑 <span>PDF</span></button>
     <div class="spacer"></div>
     <span id="db-size-badge" style="font-size:10px;color:var(--fg2);margin-right:8px">DB: --</span>
-    <span id="version-badge">v0.9.6 by Keynes Hsu</span>
+    <span id="egress-badge" style="font-size:10px;color:var(--fg2);margin-right:8px;display:none">Egress: --</span>
+    <span id="version-badge">v{{APP_VERSION}} by Keynes Hsu</span>
     <button class="theme-btn" onclick="cycleTheme()" title="Toggle theme" id="theme-icon">🌙</button>
     <button class="btn btn-ghost btn-sm" onclick="refreshList()">🔄</button>
   </div>
@@ -1825,6 +2230,7 @@ HTML = r"""<!DOCTYPE html>
             <th onclick="sortBy('task_summary')">Task Summary ⇅</th>
             <th>Worklogs</th>
             <th onclick="sortBy('project_schedule')">Milestone ⇅</th>
+            <th onclick="sortBy('todo_content')">To-Do ⇅</th>
             <th onclick="sortBy('application')">Application ⇅</th>
             <th onclick="sortBy('sso_modeln')">SSO/ModelN# ⇅</th>
             <th onclick="sortBy('mchp_device')">MCHP Device ⇅</th>
@@ -1847,6 +2253,7 @@ HTML = r"""<!DOCTYPE html>
   <div id="modal">
     <div id="modal-header">
       <h2 id="modal-title">New Record</h2>
+      <span id="auto-save-indicator" style="font-size:11px;color:var(--green);opacity:0;transition:opacity 0.3s;margin-left:12px"></span>
       <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button>
     </div>
     <div id="modal-body">
@@ -1914,7 +2321,7 @@ HTML = r"""<!DOCTYPE html>
           <select id="f-status-field"></select>
         </div>
         <div class="form-row" style="align-self:end">
-          <label><input type="checkbox" id="f-archive" style="width:auto;margin-right:6px">Archived</label>
+          <label><input type="checkbox" id="f-archive" style="width:auto;margin-right:6px">Archive</label>
         </div>
         <!-- Full width -->
         <div class="form-row form-full">
@@ -1965,6 +2372,15 @@ HTML = r"""<!DOCTYPE html>
             <code>- bullet</code> <code>1. list</code>
           </div>
         </div>
+        <!-- To-Do -->
+        <div class="form-row form-full">
+          <label>To-Do</label>
+          <textarea id="f-todo_content" rows="3" placeholder="What needs to be done..."></textarea>
+        </div>
+        <div class="form-row">
+          <label>Due Date</label>
+          <input type="date" id="f-todo_due_date">
+        </div>
       </div>
     </div>
     <div id="modal-footer">
@@ -2006,6 +2422,52 @@ HTML = r"""<!DOCTYPE html>
     <div style="display:flex;gap:8px;justify-content:flex-end">
       <button class="btn btn-ghost" onclick="closeWeekSelect()">Cancel</button>
       <button class="btn btn-word" onclick="confirmWeekExport()">📄 Export</button>
+    </div>
+  </div>
+</div>
+
+<!-- Excel Export Options Modal -->
+<div id="excel-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:115;align-items:center;justify-content:center;padding:12px">
+  <div style="background:var(--bg2);border-radius:14px;padding:20px;max-width:420px;width:100%;border:1px solid var(--border)">
+    <h2 style="margin-bottom:12px;font-size:15px">📊 Export to Excel</h2>
+    <p style="font-size:12px;color:var(--fg2);margin-bottom:14px">
+      Select export format:
+    </p>
+
+    <!-- Format Selection -->
+    <div style="margin-bottom:16px">
+      <label style="display:block;margin-bottom:8px;cursor:pointer;padding:10px;background:var(--bg3);border-radius:8px;border:2px solid transparent" id="format-wlr-label">
+        <input type="radio" name="excel-format" value="WLR" id="format-wlr" checked style="margin-right:8px">
+        <strong>WLR Format</strong> — Work Log Report
+        <div style="font-size:11px;color:var(--fg2);margin-left:24px;margin-top:4px">
+          Comprehensive reporting format with all key fields
+        </div>
+      </label>
+      <label style="display:block;cursor:pointer;padding:10px;background:var(--bg3);border-radius:8px;border:2px solid transparent" id="format-todo-label">
+        <input type="radio" name="excel-format" value="TODO" id="format-todo" style="margin-right:8px">
+        <strong>To-Do Format</strong> — Task List
+        <div style="font-size:11px;color:var(--fg2);margin-left:24px;margin-top:4px">
+          Simple task list with due dates and checkboxes
+        </div>
+      </label>
+    </div>
+
+    <!-- Date Filter (shown only for To-Do format) -->
+    <div id="date-filter-section" style="display:none;margin-bottom:16px;padding:12px;background:var(--bg3);border-radius:8px">
+      <p style="font-size:12px;font-weight:600;margin-bottom:10px">Date Filter:</p>
+      <label style="display:block;margin-bottom:6px;cursor:pointer">
+        <input type="radio" name="date-filter" value="all" id="filter-all" checked style="margin-right:8px">
+        All Due Dates
+      </label>
+      <label style="display:block;cursor:pointer">
+        <input type="radio" name="date-filter" value="week_plus_1" id="filter-week" style="margin-right:8px">
+        Week+1 (Next 7 days only)
+      </label>
+    </div>
+
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-ghost" onclick="closeExcelSelect()">Cancel</button>
+      <button class="btn btn-accent" onclick="confirmExcelExport()">📊 Export</button>
     </div>
   </div>
 </div>
@@ -2053,7 +2515,9 @@ HTML = r"""<!DOCTYPE html>
 
 <div id="lightbox" onclick="closeLightbox(event)">
   <button id="lightbox-close" onclick="closeLightbox()">✕</button>
-  <img id="lightbox-img" src="" alt="preview" onclick="event.stopPropagation()">
+  <div id="lightbox-container" onclick="event.stopPropagation()">
+    <img id="lightbox-img" src="" alt="preview">
+  </div>
 </div>
 
 <div id="toast"></div>
@@ -2061,7 +2525,7 @@ HTML = r"""<!DOCTYPE html>
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
 let records = [], selectedId = null, editingId = null;
-let sortCol = 'id', sortAsc = false;
+let sortCol = 'last_update', sortAsc = false;
 let cfg = {};
 let themes = ['dark','light','system'];
 let themeIdx = 0;
@@ -2194,9 +2658,10 @@ function renderTable() {
       <td>${esc((r.task_summary||'').slice(0,60))}</td>
       <td class="wl-cell">${wlSnippet(r.worklogs)}</td>
       <td>${esc((r.project_schedule||'').slice(0,60))}</td>
+      <td>${esc((r.todo_content||'').slice(0,40))}${r.todo_due_date?' 📅'+r.todo_due_date:''}</td>
       <td>${esc(r.application||'')}</td>
       <td>${esc(r.sso_modeln||'')}</td>
-      <td>${esc(r.mchp_device||'')}</td>
+      <td class="mchp-device-cell">${esc(r.mchp_device||'')}</td>
       <td>${esc(r.ear||'')}</td>
       <td>${esc(r.bu||'')}</td>
       <td>${r.last_update||''}</td>
@@ -2232,9 +2697,75 @@ function openModal(title) {
   document.getElementById('modal-overlay').classList.add('open');
 }
 function closeModal() {
+  // Check for unsaved changes
+  if (hasUnsavedChanges()) {
+    if (!confirm('You have unsaved changes. Close without saving?')) {
+      return; // User canceled close
+    }
+  }
+
+  // Clear auto-save state
+  if (autoSaveTimer) clearTimeout(autoSaveTimer);
+  autoSaveTimer = null;
+  initialFormState = null;
+
   document.getElementById('modal-overlay').classList.remove('open');
   editingId=null; pendingImages=[];
   document.getElementById('img-preview-area').innerHTML='';
+}
+
+// ── Auto-save State ────────────────────────────────────────────────────────
+let autoSaveTimer = null;
+let autoSaveInProgress = false;
+let initialFormState = null;
+
+function captureFormState() {
+  if (!editingId) return null; // Only track state for existing records
+  return {
+    task_summary: document.getElementById('f-task_summary')?.value || '',
+    worklogs: document.getElementById('f-worklogs')?.value || '',
+    project_schedule: document.getElementById('f-project_schedule')?.value || '',
+    todo_content: document.getElementById('f-todo_content')?.value || ''
+  };
+}
+
+function hasUnsavedChanges() {
+  if (!editingId || !initialFormState) return false;
+  const current = captureFormState();
+  return JSON.stringify(current) !== JSON.stringify(initialFormState);
+}
+
+function scheduleAutoSave() {
+  if (!editingId) return; // Only auto-save existing records
+  if (autoSaveTimer) clearTimeout(autoSaveTimer);
+
+  autoSaveTimer = setTimeout(async () => {
+    if (autoSaveInProgress) return;
+
+    autoSaveInProgress = true;
+    try {
+      const data = formData();
+      const res = await fetch(`/api/records/${editingId}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data)
+      });
+
+      if (res.ok) {
+        initialFormState = captureFormState(); // Update baseline after successful save
+        const indicator = document.getElementById('auto-save-indicator');
+        if (indicator) {
+          indicator.textContent = '✓ Auto-saved';
+          indicator.style.opacity = '1';
+          setTimeout(() => { indicator.style.opacity = '0'; }, 1500);
+        }
+      }
+    } catch (e) {
+      console.error('Auto-save failed:', e);
+    } finally {
+      autoSaveInProgress = false;
+    }
+  }, 3000); // 3 seconds debounce
 }
 
 function dateFmt(s) {
@@ -2276,6 +2807,8 @@ function fillForm(rec) {
   fd('status-field',rec.status||'Not Started');
   fd('task_summary',rec.task_summary);
   fd('project_schedule',rec.project_schedule);
+  fd('todo_content', rec.todo_content);
+  fd('todo_due_date', dateFmt(rec.todo_due_date));
   document.getElementById('f-archive').checked = rec.archive==='Yes';
   // Character hints
   updateCharHint(document.getElementById('f-customer'),'ch-cust');
@@ -2297,6 +2830,19 @@ function fillForm(rec) {
     _addImageThumb(uid, m[1]);
   }
   document.getElementById('f-worklogs').value = wlDisplay;
+
+  // Capture initial state for change detection
+  initialFormState = captureFormState();
+
+  // Attach auto-save listeners to monitored fields
+  const autoSaveFields = ['f-task_summary', 'f-worklogs', 'f-project_schedule', 'f-todo_content'];
+  autoSaveFields.forEach(fieldId => {
+    const el = document.getElementById(fieldId);
+    if (el) {
+      el.removeEventListener('input', scheduleAutoSave); // Prevent duplicate listeners
+      el.addEventListener('input', scheduleAutoSave);
+    }
+  });
 }
 
 function formData() {
@@ -2322,6 +2868,8 @@ function formData() {
     status:       gv('f-status-field'),
     task_summary: gv('f-task_summary'),
     project_schedule: gv('f-project_schedule'),
+    todo_content: gv('f-todo_content'),
+    todo_due_date: dateOut(gv('f-todo_due_date')),
     worklogs:     wl,
     archive:      document.getElementById('f-archive').checked ? 'Yes':'No',
   };
@@ -2366,6 +2914,9 @@ async function saveRecord() {
       console.error('Save error:', json);
       return;
     }
+    // Clear auto-save timer and update initial state
+    if (autoSaveTimer) clearTimeout(autoSaveTimer);
+    initialFormState = null; // Reset so closeModal doesn't warn
     closeModal();
     await refreshList();
     toast(editingId ? '✅ Record updated' : '✅ Record added');
@@ -2378,8 +2929,15 @@ async function saveRecord() {
 async function deleteRecord() {
   if (!selectedId) { toast('Select a record first'); return; }
   if (!confirm('Delete this record?')) return;
-  await fetch(`/api/records/${selectedId}`, {method:'DELETE'});
-  selectedId=null; refreshList(); toast('Deleted');
+  try {
+    const res = await fetch(`/api/records/${selectedId}`, {method:'DELETE'});
+    if (!res.ok) { toast('❌ Delete failed'); return; }
+    selectedId = null;
+    await refreshList();
+    toast('🗑 Deleted');
+  } catch(e) {
+    toast('❌ Network error: ' + e.message);
+  }
 }
 
 // ── Worklogs ──────────────────────────────────────────────────────────────────
@@ -2450,11 +3008,11 @@ function parseMarkdown(md) {
   const IMG_TOK = [];
   md = md.replace(/\[📷 (img_[a-z0-9]+)\]/g, (_, uid) => {
     const obj = pendingImages.find(p => p.uid === uid);
-    IMG_TOK.push(obj ? `<img src="data:image/png;base64,${obj.b64}" class="img-thumb">` : '<span style="color:var(--fg2)">[📷]</span>');
+    IMG_TOK.push(obj ? `<img src="data:image/png;base64,${obj.b64}" class="img-thumb" onclick="openLightbox(this.src)" style="cursor:pointer">` : '<span style="color:var(--fg2)">[📷]</span>');
     return `\x00IMG${IMG_TOK.length - 1}\x00`;
   });
   md = md.replace(/\[IMG_B64:([A-Za-z0-9+/=]+)\]/g, (_, b64) => {
-    IMG_TOK.push(`<img src="data:image/png;base64,${b64}" class="img-thumb">`);
+    IMG_TOK.push(`<img src="data:image/png;base64,${b64}" class="img-thumb" onclick="openLightbox(this.src)" style="cursor:pointer">`);
     return `\x00IMG${IMG_TOK.length - 1}\x00`;
   });
 
@@ -2695,24 +3253,87 @@ async function exportWord() {
   await openWeekSelect();
 }
 
+// ── Excel Export Modal ───────────────────────────────────────────────────────
+let excelExportIds = [];
+
 async function exportExcel() {
   const ids = [...checkedIds];
   if (ids.length === 0) { toast('☑ Check at least one record first'); return; }
+  excelExportIds = ids;
+  openExcelSelect();
+}
+
+function openExcelSelect() {
+  document.getElementById('excel-overlay').style.display = 'flex';
+
+  // Setup format change listener to show/hide date filter
+  const wlrRadio = document.getElementById('format-wlr');
+  const todoRadio = document.getElementById('format-todo');
+  const dateFilterSection = document.getElementById('date-filter-section');
+
+  const updateDateFilter = () => {
+    dateFilterSection.style.display = todoRadio.checked ? 'block' : 'none';
+  };
+
+  wlrRadio.addEventListener('change', updateDateFilter);
+  todoRadio.addEventListener('change', updateDateFilter);
+  updateDateFilter(); // Initial state
+
+  // Visual feedback for selected format
+  const wlrLabel = document.getElementById('format-wlr-label');
+  const todoLabel = document.getElementById('format-todo-label');
+
+  const updateLabels = () => {
+    wlrLabel.style.borderColor = wlrRadio.checked ? 'var(--accent)' : 'transparent';
+    todoLabel.style.borderColor = todoRadio.checked ? 'var(--accent)' : 'transparent';
+  };
+
+  wlrRadio.addEventListener('change', updateLabels);
+  todoRadio.addEventListener('change', updateLabels);
+  updateLabels();
+}
+
+function closeExcelSelect() {
+  document.getElementById('excel-overlay').style.display = 'none';
+  excelExportIds = [];
+}
+
+async function confirmExcelExport() {
+  const format = document.querySelector('input[name="excel-format"]:checked').value;
+  const dateFilter = document.querySelector('input[name="date-filter"]:checked').value;
+
+  closeExcelSelect();
+  toast(`Generating Excel export...`);
+
   try {
     const res = await fetch('/api/export/excel', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ ids })
+      body: JSON.stringify({
+        ids: excelExportIds,
+        format: format,
+        date_filter: dateFilter
+      })
     });
-    if (!res.ok) throw new Error(await res.text());
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({error: res.statusText}));
+      toast('❌ Export failed: ' + (err.error || res.status));
+      return;
+    }
+
     const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `WorkLog_${new Date().toISOString().slice(0,10)}.xlsx`;
+    a.href = url;
+
+    const formatPrefix = format === 'WLR' ? 'WorkLog_WLR' : 'WorkLog_ToDo';
+    a.download = `${formatPrefix}_${new Date().toISOString().slice(0,10)}.xlsx`;
     a.click();
-    toast('📊 Excel exported successfully');
+    URL.revokeObjectURL(url);
+    toast('✅ Excel exported successfully');
   } catch (e) {
-    toast('❌ Excel export failed: ' + e.message);
+    toast('❌ ' + e.message);
   }
 }
 
@@ -2879,25 +3500,35 @@ async function syncNow() {
     // First test connectivity and show diagnostics if not configured
     const testRes  = await fetch('/api/sync/test');
     const testData = await testRes.json();
+    const isPostgres = testData.backend === 'postgres';
 
-    if (!testData.has_pocketbase_lib) {
-      toast('❌ pocketbase library missing — run: pip install pocketbase'); return;
+    if (!isPostgres) {
+      // PocketBase-specific checks
+      if (!testData.has_pocketbase_lib) {
+        toast('❌ pocketbase library missing — run: pip install pocketbase'); return;
+      }
+      if (!testData.configured) {
+        toast('⚙️ No cloud database configured — set credentials in Settings'); return;
+      }
     }
     if (!testData.configured) {
-      toast('⚙️ PocketBase not configured — set URL and Key in .env'); return;
+      toast('⚙️ No cloud database configured — set credentials in Settings'); return;
     }
     if (!testData.online) {
-      toast(`📴 Cannot reach ${testData.url} — check credentials or WiFi`); return;
+      const detail = testData.error ? `\n${testData.error}` : '';
+      toast(`📴 Cannot reach ${testData.url} — check credentials or network${detail}`); return;
     }
 
-    // Check if PocketBase schema is up to date
-    const schemaRes = await fetch('/api/sync/check-schema');
-    const schemaData = await schemaRes.json();
-    if (schemaData.ok === false && schemaData.missing_columns) {
-      if (confirm(`⚠️ PocketBase database needs update!\n\nMissing columns: ${schemaData.missing_columns.join(', ')}\n\nPlease run the migration SQL in SUPABASE_MIGRATION.md\n\nContinue sync anyway? (May cause errors)`)) {
-        // User chose to continue despite schema mismatch
-      } else {
-        return; // User cancelled
+    // Schema check only for PocketBase
+    if (!isPostgres) {
+      const schemaRes = await fetch('/api/sync/check-schema');
+      const schemaData = await schemaRes.json();
+      if (schemaData.ok === false && schemaData.missing_columns) {
+        if (confirm(`⚠️ PocketBase database needs update!\n\nMissing columns: ${schemaData.missing_columns.join(', ')}\n\nContinue sync anyway? (May cause errors)`)) {
+          // User chose to continue despite schema mismatch
+        } else {
+          return; // User cancelled
+        }
       }
     }
 
@@ -2912,15 +3543,7 @@ async function syncNow() {
       if (data.conflicts) msg.push(`⚠ ${data.conflicts} conflict(s)`);
       if (data.errors && data.errors.length) {
         console.error('Sync errors:', data.errors);
-        // Check if errors are due to missing PocketBase columns
-        const schemaError = data.errors.some(e =>
-          e.includes('column') || e.includes('does not exist') || e.includes('unknown')
-        );
-        if (schemaError) {
-          msg.push(`⚠️ Schema mismatch - update PocketBase (see SUPABASE_MIGRATION.md)`);
-        } else {
-          msg.push(`${data.errors.length} error(s)`);
-        }
+        msg.push(`${data.errors.length} error(s)`);
       }
       toast(msg.length ? `✅ Sync: ${msg.join(', ')}` : '✅ Up to date');
       await refreshList();
@@ -3030,14 +3653,16 @@ document.addEventListener('keydown', e => {
 });
 
 function openLightbox(src) {
-  const lb  = document.getElementById('lightbox');
+  const lb = document.getElementById('lightbox');
+  const container = document.getElementById('lightbox-container');
   const img = document.getElementById('lightbox-img');
-  img.src   = src;
-  // Reset any previous resize and let it size naturally up to viewport
-  img.style.width  = '';
-  img.style.height = '';
+  img.src = src;
+  // Reset container size
+  container.style.width = '600px';
+  container.style.height = '450px';
   lb.classList.add('open');
 }
+
 function closeLightbox(e) {
   // If called from backdrop click, only close when clicking the backdrop itself
   if (e && e.target !== document.getElementById('lightbox') &&
@@ -3045,6 +3670,25 @@ function closeLightbox(e) {
   document.getElementById('lightbox').classList.remove('open');
   document.getElementById('lightbox-img').src = '';
 }
+
+// Mouse wheel zoom for lightbox image
+document.addEventListener('DOMContentLoaded', function() {
+  const container = document.getElementById('lightbox-container');
+  if (container) {
+    container.addEventListener('wheel', function(e) {
+      e.preventDefault();
+      const currentWidth = container.offsetWidth;
+      const currentHeight = container.offsetHeight;
+      const delta = e.deltaY > 0 ? 0.9 : 1.1; // Zoom out or in
+
+      const newWidth = Math.max(200, Math.min(currentWidth * delta, window.innerWidth * 0.95));
+      const newHeight = Math.max(150, Math.min(currentHeight * delta, window.innerHeight * 0.95));
+
+      container.style.width = newWidth + 'px';
+      container.style.height = newHeight + 'px';
+    });
+  }
+});
 
 boot();
 startSyncPoller();
@@ -3054,7 +3698,8 @@ startSyncPoller();
 
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    html_with_version = HTML.replace('{{APP_VERSION}}', APP_VERSION)
+    return render_template_string(html_with_version)
 
 @app.route("/manifest.json")
 def manifest():

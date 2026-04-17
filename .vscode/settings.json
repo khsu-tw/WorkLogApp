@@ -1,9 +1,3 @@
 {
-  "editor.formatOnSave": true,
-  "editor.tabSize": 4,
-  "files.exclude": {
-    "**/__pycache__": true,
-    "**/*.pyc": true,
-    ".venv": true
-  }
+    "python.terminal.useEnvFile": true
 }

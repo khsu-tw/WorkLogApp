@@ -1,14 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-Work Log Journal - PyInstaller Spec File
-=========================================
-This file configures how PyInstaller packages the application.
+Work Log Journal - PyInstaller Spec File for Linux
+===================================================
+This file configures how PyInstaller packages the application for Linux/Ubuntu.
 
 Usage:
-    pyinstaller --clean worklog.spec
+    pyinstaller --clean worklog_linux.spec
 
 Or simply run:
-    build.bat
+    ./build_linux.sh
 """
 
 import sys
@@ -115,12 +115,9 @@ exe = EXE(
     upx=True,
     console=False,  # No console window (GUI app)
     disable_windowed_traceback=False,
-    argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,  # Add icon path here if you have one: icon='icon.ico'
-    version='version_info.txt' if Path('version_info.txt').exists() else None,
 )
 
 coll = COLLECT(

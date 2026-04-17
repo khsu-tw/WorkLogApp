@@ -1,5 +1,6 @@
 flask>=3.0
 pocketbase>=0.15.0
+psycopg2-binary>=2.9.9
 python-docx>=0.8.11
 requests>=2.31.0
 Pillow>=10.0

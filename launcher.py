@@ -2,7 +2,7 @@
 Work Log Journal — Launcher
 ===========================
 Entry point for the packaged application.
-• On first run: shows a setup wizard asking for Supabase credentials
+• On first run: shows a setup wizard asking for database credentials (PocketBase or PostgreSQL)
 • Saves credentials to .env in the app data folder
 • Starts the Flask server in a background thread
 • Opens the browser automatically
@@ -25,14 +25,22 @@ import shutil
 
 # ── Determine data directory (writable even when packaged) ───────────────────
 if getattr(sys, 'frozen', False):
-    # Running as PyInstaller bundle
-    APP_DIR  = Path(sys.executable).parent
-    BASE_DIR = Path(sys._MEIPASS)          # bundled files
+    BASE_DIR = Path(sys._MEIPASS)          # bundled files (read-only)
+    _exe = Path(sys.executable).resolve()
+    # macOS .app bundle: executable is at WorkLog.app/Contents/MacOS/WorkLog
+    # Store user data (*.env, *.db) NEXT TO the .app, not inside it —
+    # so it survives clean rebuilds and is accessible to the user.
+    if (sys.platform == 'darwin'
+            and _exe.parent.name == 'MacOS'
+            and _exe.parent.parent.name == 'Contents'):
+        APP_DIR = _exe.parent.parent.parent.parent  # directory containing WorkLog.app
+    else:
+        APP_DIR = _exe.parent               # Windows / Linux single-dir bundle
 else:
     APP_DIR  = Path(__file__).parent
     BASE_DIR = Path(__file__).parent
 
-APP_VERSION = "0.9.6"
+APP_VERSION = "1.0.1"
 ENV_FILE = APP_DIR / ".env"
 VERSION_FILE = APP_DIR / ".last_version"
 BACKUP_DIR = APP_DIR / "backups"
@@ -41,10 +49,13 @@ PORT     = 5000   # default; _find_free_port() may change this at runtime
 # ── Colours ──────────────────────────────────────────────────────────────────
 DARK     = "#1E3A5F"
 ACCENT   = "#2E75B6"
-LIGHT    = "#F0F4FB"
+LIGHT    = "#F7F9FC"   # wizard body background
 WHITE    = "#FFFFFF"
 GREEN    = "#16A34A"
 RED      = "#DC2626"
+TEXT     = "#1F2937"   # primary text on light bg
+SUBTEXT  = "#6B7280"   # secondary text on light bg
+DIM_DARK = "#94A3B8"   # readable text on dark bg (was #64748B — too dim)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -52,12 +63,13 @@ RED      = "#DC2626"
 # ─────────────────────────────────────────────────────────────────────────────
 class SetupWizard(tk.Toplevel):
     """
-    Modal dialog that asks the user for PocketBase credentials.
-    Shown on first launch or when .env is missing / invalid.
+    Modal dialog that asks the user for database credentials.
+    Supports PostgreSQL, PocketBase, or local-only mode.
+    Shown on first launch or when reconfiguring via Settings.
     """
     def __init__(self, parent, existing: dict):
         super().__init__(parent)
-        self.title("Work Log — Initial Setup")
+        self.title("Work Log — Database Setup")
         self.resizable(False, False)
         self.configure(bg=LIGHT)
         self.grab_set()
@@ -67,7 +79,10 @@ class SetupWizard(tk.Toplevel):
 
     def _center(self):
         self.update_idletasks()
-        w, h = self.winfo_width(), self.winfo_height()
+        # Use reqwidth/reqheight: reflects content-based size, not current window size.
+        # More reliable than winfo_width/height after geometry("") on macOS.
+        w = self.winfo_reqwidth()
+        h = self.winfo_reqheight()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
@@ -78,71 +93,161 @@ class SetupWizard(tk.Toplevel):
         tk.Label(hdr, text="  📋  Work Log Journal", font=("Arial", 14, "bold"),
                  bg=DARK, fg=WHITE).pack(side="left", padx=14, pady=10)
 
-        body = tk.Frame(self, bg=LIGHT, padx=24, pady=18)
+        body = tk.Frame(self, bg=WHITE, padx=24, pady=18)
         body.pack(fill="both", expand=True)
 
         # Intro
-        intro = ("Welcome!  Work Log can store data in the cloud using PocketBase,\n"
-                 "or locally on this computer.\n\n"
-                 "Leave URL blank to use local storage only.")
-        tk.Label(body, text=intro, font=("Arial", 9), bg=LIGHT, fg="#374151",
-                 justify="left", anchor="w").pack(fill="x", pady=(0, 16))
+        tk.Label(body, text="選擇雲端資料庫類型，或僅使用本機儲存。",
+                 font=("Arial", 10), bg=WHITE, fg=TEXT,
+                 justify="left", anchor="w").pack(fill="x", pady=(0, 10))
 
-        # PocketBase URL
-        tk.Label(body, text="PocketBase URL", font=("Arial", 9, "bold"),
-                 bg=LIGHT, fg=DARK, anchor="w").pack(fill="x")
-        self._url = ttk.Entry(body, font=("Arial", 10), width=52)
-        self._url.insert(0, existing.get("POCKETBASE_URL", "http://127.0.0.1:8090"))
-        self._url.pack(fill="x", pady=(2, 10))
-        tk.Label(body, text="e.g. http://127.0.0.1:8090 or https://your-pocketbase-server.com",
-                 font=("Arial", 8), bg=LIGHT, fg="#6B7280", anchor="w").pack(fill="x")
+        # ── DB type radio buttons ────────────────────────────────────────────
+        # Use tk.Radiobutton with explicit indicator colors so macOS shows them
+        if existing.get("POSTGRES_URL"):
+            default_mode = "postgres"
+        elif existing.get("POCKETBASE_URL"):
+            default_mode = "pocketbase"
+        else:
+            default_mode = "local"
 
-        # PocketBase Token (Optional)
-        tk.Label(body, text="PocketBase Token (Optional)", font=("Arial", 9, "bold"),
-                 bg=LIGHT, fg=DARK, anchor="w").pack(fill="x", pady=(12, 0))
-        self._key = ttk.Entry(body, font=("Arial", 10), width=52, show="•")
-        self._key.insert(0, existing.get("POCKETBASE_TOKEN", ""))
-        self._key.pack(fill="x", pady=(2, 4))
-        tk.Label(body,
-                 text="Generate in: PocketBase Admin UI → Settings → API Keys",
-                 font=("Arial", 8), bg=LIGHT, fg="#6B7280",
-                 anchor="w", wraplength=460, justify="left").pack(fill="x")
+        self._mode = tk.StringVar(value=default_mode)
 
-        # Show / hide key
-        self._show_key = tk.BooleanVar(value=False)
-        ttk.Checkbutton(body, text="Show token", variable=self._show_key,
-                        command=self._toggle_key).pack(anchor="w", pady=(2, 0))
+        radio_frame = tk.Frame(body, bg=WHITE)
+        radio_frame.pack(fill="x", pady=(0, 10))
 
-        # Separator
-        tk.Frame(body, bg="#E5E7EB", height=1).pack(fill="x", pady=14)
+        for val, label in [
+            ("postgres",   "PostgreSQL  (Raspberry Pi / VPS)"),
+            ("pocketbase", "PocketBase"),
+            ("local",      "僅本機儲存（SQLite）"),
+        ]:
+            tk.Radiobutton(
+                radio_frame, text=label, variable=self._mode, value=val,
+                command=self._on_mode_change,
+                bg=WHITE, fg=TEXT,
+                activebackground=WHITE, activeforeground=DARK,
+                selectcolor=WHITE,          # macOS: colour of the dot's bg circle
+                font=("Arial", 10),
+                anchor="w", padx=2,
+            ).pack(fill="x", pady=2)
 
-        # Buttons
-        btn_row = tk.Frame(body, bg=LIGHT)
+        tk.Frame(body, bg="#D1D5DB", height=1).pack(fill="x", pady=(4, 0))
+
+        # ── Panel container — use grid so switching doesn't break layout order
+        self._panel_host = tk.Frame(body, bg=WHITE)
+        self._panel_host.pack(fill="x")
+        self._panel_host.columnconfigure(0, weight=1)
+
+        # ── PostgreSQL panel ─────────────────────────────────────────────────
+        self._pg_frame = tk.Frame(self._panel_host, bg=WHITE, pady=12)
+        self._pg_frame.columnconfigure(0, weight=1)
+
+        tk.Label(self._pg_frame, text="PostgreSQL URL",
+                 font=("Arial", 10, "bold"), bg=WHITE, fg=TEXT,
+                 anchor="w").grid(row=0, column=0, sticky="w")
+        self._pg_url = ttk.Entry(self._pg_frame, font=("Arial", 10), width=54)
+        self._pg_url.insert(0, existing.get("POSTGRES_URL",
+                            "postgresql://worklog_user:密碼@192.168.1.xxx:5432/worklogdb"))
+        self._pg_url.grid(row=1, column=0, sticky="ew", pady=(4, 2))
+        tk.Label(self._pg_frame,
+                 text="格式：postgresql://使用者:密碼@主機IP:5432/資料庫名",
+                 font=("Arial", 9), bg=WHITE, fg=SUBTEXT,
+                 anchor="w").grid(row=2, column=0, sticky="w")
+
+        # ── PocketBase panel ─────────────────────────────────────────────────
+        self._pb_frame = tk.Frame(self._panel_host, bg=WHITE, pady=12)
+        self._pb_frame.columnconfigure(0, weight=1)
+
+        tk.Label(self._pb_frame, text="PocketBase URL",
+                 font=("Arial", 10, "bold"), bg=WHITE, fg=TEXT,
+                 anchor="w").grid(row=0, column=0, sticky="w")
+        self._pb_url = ttk.Entry(self._pb_frame, font=("Arial", 10), width=54)
+        self._pb_url.insert(0, existing.get("POCKETBASE_URL", "http://127.0.0.1:8090"))
+        self._pb_url.grid(row=1, column=0, sticky="ew", pady=(4, 2))
+        tk.Label(self._pb_frame,
+                 text="e.g. http://127.0.0.1:8090 or https://your-pocketbase-server.com",
+                 font=("Arial", 9), bg=WHITE, fg=SUBTEXT,
+                 anchor="w").grid(row=2, column=0, sticky="w")
+
+        tk.Label(self._pb_frame, text="PocketBase Token（選填）",
+                 font=("Arial", 10, "bold"), bg=WHITE, fg=TEXT,
+                 anchor="w").grid(row=3, column=0, sticky="w", pady=(14, 0))
+        self._pb_token = ttk.Entry(self._pb_frame, font=("Arial", 10), width=54, show="•")
+        self._pb_token.insert(0, existing.get("POCKETBASE_TOKEN", ""))
+        self._pb_token.grid(row=4, column=0, sticky="ew", pady=(4, 2))
+        tk.Label(self._pb_frame,
+                 text="PocketBase Admin UI → Settings → API Keys",
+                 font=("Arial", 9), bg=WHITE, fg=SUBTEXT,
+                 anchor="w").grid(row=5, column=0, sticky="w")
+        self._show_token = tk.BooleanVar(value=False)
+        tk.Checkbutton(self._pb_frame, text="顯示 Token", variable=self._show_token,
+                       command=self._toggle_token,
+                       bg=WHITE, fg=TEXT, activebackground=WHITE,
+                       selectcolor=WHITE, font=("Arial", 9),
+                       ).grid(row=6, column=0, sticky="w", pady=(6, 0))
+
+        # ── Local panel ──────────────────────────────────────────────────────
+        self._local_frame = tk.Frame(self._panel_host, bg=WHITE, pady=12)
+        tk.Label(self._local_frame,
+                 text="所有資料儲存在本機 SQLite 資料庫，無需任何外部服務。",
+                 font=("Arial", 10), bg=WHITE, fg=TEXT, justify="left").pack(anchor="w")
+
+        # All panels in same grid cell — show/hide with grid()/grid_remove()
+        for f in (self._pg_frame, self._pb_frame, self._local_frame):
+            f.grid(row=0, column=0, sticky="ew")
+            f.grid_remove()
+
+        # Show default panel
+        self._on_mode_change()
+
+        # Separator + button
+        tk.Frame(body, bg="#D1D5DB", height=1).pack(fill="x", pady=(0, 14))
+        btn_row = tk.Frame(body, bg=WHITE)
         btn_row.pack(fill="x")
-        tk.Button(btn_row, text="Use Local Storage Only",
-                  command=self._use_local,
-                  bg="#E5E7EB", fg="#374151", font=("Arial", 9),
-                  padx=12, pady=6, relief="flat", cursor="hand2"
-                  ).pack(side="left")
-        tk.Button(btn_row, text="▶  Start App",
-                  command=self._save,
-                  bg=ACCENT, fg=WHITE, font=("Arial", 10, "bold"),
-                  padx=18, pady=6, relief="flat", cursor="hand2",
-                  activebackground=DARK, activeforeground=WHITE
-                  ).pack(side="right")
+        ttk.Button(btn_row, text="▶  Start App", command=self._save,
+                   ).pack(side="right")
 
-    def _toggle_key(self):
-        self._key.config(show="" if self._show_key.get() else "•")
+    def _on_mode_change(self):
+        """Switch visible panel, then auto-resize the window to fit."""
+        self._pg_frame.grid_remove()
+        self._pb_frame.grid_remove()
+        self._local_frame.grid_remove()
+        mode = self._mode.get()
+        if mode == "postgres":
+            self._pg_frame.grid()
+        elif mode == "pocketbase":
+            self._pb_frame.grid()
+        else:
+            self._local_frame.grid()
+        # Two update_idletasks() passes: first propagates grid changes,
+        # second processes the geometry("") auto-size request.
+        self.update_idletasks()
+        self.geometry("")
+        self.update_idletasks()
+        self._center()
 
-    def _use_local(self):
-        self.result = {"POCKETBASE_URL": "", "POCKETBASE_TOKEN": ""}
-        self.destroy()
+    def _toggle_token(self):
+        self._pb_token.config(show="" if self._show_token.get() else "•")
 
     def _save(self):
-        self.result = {
-            "POCKETBASE_URL": self._url.get().strip(),
-            "POCKETBASE_TOKEN": self._key.get().strip(),
-        }
+        mode = self._mode.get()
+        if mode == "postgres":
+            self.result = {
+                "POSTGRES_URL":    self._pg_url.get().strip(),
+                "POCKETBASE_URL":  "",
+                "POCKETBASE_TOKEN": "",
+            }
+        elif mode == "pocketbase":
+            self.result = {
+                "POSTGRES_URL":    "",
+                "POCKETBASE_URL":  self._pb_url.get().strip(),
+                "POCKETBASE_TOKEN": self._pb_token.get().strip(),
+            }
+        else:
+            self.result = {
+                "POSTGRES_URL":    "",
+                "POCKETBASE_URL":  "",
+                "POCKETBASE_TOKEN": "",
+            }
         self.destroy()
 
 
@@ -174,7 +279,7 @@ class ControlWindow(tk.Tk):
                  font=("Arial", 14, "bold"),
                  bg=DARK, fg=WHITE).pack(pady=(20, 4))
         tk.Label(self, text="Server Control Panel",
-                 font=("Arial", 9), bg=DARK, fg="#93C5FD").pack()
+                 font=("Arial", 9), bg=DARK, fg="#BAD4F5").pack()
 
         # Status indicator
         status_frame = tk.Frame(self, bg=DARK)
@@ -183,46 +288,39 @@ class ControlWindow(tk.Tk):
                              bg=DARK, fg="#F59E0B")
         self._dot.pack(side="left", padx=(0, 6))
         self._status_lbl = tk.Label(status_frame, text="Starting…",
-                                     font=("Arial", 10), bg=DARK, fg=WHITE)
+                                     font=("Arial", 11, "bold"), bg=DARK, fg=WHITE)
         self._status_lbl.pack(side="left")
 
-        # URL label
+        # URL label — brighter blue, larger font
         self._url_lbl = tk.Label(self, text="",
-                                  font=("Arial", 9), bg=DARK, fg="#93C5FD",
+                                  font=("Arial", 10, "underline"), bg=DARK, fg="#60A5FA",
                                   cursor="hand2")
         self._url_lbl.pack()
         self._url_lbl.bind("<Button-1>", lambda _: self._open_browser())
 
-        # DB label
+        # DB label — was #64748B (too dim), now DIM_DARK (#94A3B8)
         self._db_lbl = tk.Label(self, text="",
-                                 font=("Arial", 8), bg=DARK, fg="#64748B")
+                                 font=("Arial", 9), bg=DARK, fg=DIM_DARK)
         self._db_lbl.pack(pady=(4, 0))
 
-        # Buttons
+        # Buttons — ttk for native macOS rendering
         btn_frame = tk.Frame(self, bg=DARK)
         btn_frame.pack(pady=20)
 
-        tk.Button(btn_frame, text="🌐  Open Browser",
-                  command=self._open_browser,
-                  bg=ACCENT, fg=WHITE, font=("Arial", 10, "bold"),
-                  padx=14, pady=6, relief="flat", cursor="hand2",
-                  activebackground="#1E60A0"
-                  ).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="🌐  Open Browser",
+                   command=self._open_browser,
+                   ).pack(side="left", padx=5)
 
-        tk.Button(btn_frame, text="⚙  Settings",
-                  command=self._open_settings,
-                  bg="#334155", fg=WHITE, font=("Arial", 10),
-                  padx=10, pady=6, relief="flat", cursor="hand2"
-                  ).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="⚙  Settings",
+                   command=self._open_settings,
+                   ).pack(side="left", padx=5)
 
-        tk.Button(btn_frame, text="✕  Stop",
-                  command=self._on_close,
-                  bg=RED, fg=WHITE, font=("Arial", 10),
-                  padx=10, pady=6, relief="flat", cursor="hand2"
-                  ).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="✕  Stop",
+                   command=self._on_close,
+                   ).pack(side="left", padx=5)
 
         tk.Label(self, text=f"v{APP_VERSION}  |  port {PORT}",
-                 font=("Arial", 7), bg=DARK, fg="#475569").pack(side="bottom", pady=8)
+                 font=("Arial", 8), bg=DARK, fg=DIM_DARK).pack(side="bottom", pady=8)
 
     # ── Boot sequence ─────────────────────────────────────────────────────────
     def _boot(self):
@@ -236,7 +334,7 @@ class ControlWindow(tk.Tk):
             self.after(100, self._start_server)
 
     def _run_setup(self, reconfigure=False):
-        env = _load_env() if not reconfigure else {}
+        env = _load_env()   # always pre-fill wizard with existing .env values
         dlg = SetupWizard(self, env)
         self.wait_window(dlg)
         if dlg.result is None:
@@ -255,9 +353,15 @@ class ControlWindow(tk.Tk):
         self.after(300, self._wait_for_server)
 
     def _wait_for_server(self, attempts=0):
-        if _port_open(PORT):
+        if _flask_ready(PORT):
             env = _load_env()
-            db_type = "Supabase ☁" if env.get("SUPABASE_URL") else "SQLite (local)"
+            # Determine database type based on configured environment
+            if env.get("POSTGRES_URL"):
+                db_type = "PostgreSQL ☁"
+            elif env.get("POCKETBASE_URL"):
+                db_type = "PocketBase ☁"
+            else:
+                db_type = "SQLite (local)"
             self._set_status("Running", GREEN)
             self._url_lbl.config(text=f"http://localhost:{PORT}  ← click to open")
             self._db_lbl.config(text=f"Database: {db_type}")
@@ -283,7 +387,7 @@ class ControlWindow(tk.Tk):
     def _open_settings(self):
         if messagebox.askyesno(
                 "Reconfigure",
-                "Re-enter your Supabase credentials?\n"
+                "Re-enter your database credentials?\n"
                 "(The server will restart after saving.)"):
             self._run_setup(reconfigure=True)
 
@@ -401,6 +505,18 @@ def _port_open(port: int) -> bool:
         with socket.create_connection(("127.0.0.1", port), timeout=0.5):
             return True
     except OSError:
+        return False
+
+
+def _flask_ready(port: int) -> bool:
+    """True when Flask is actually responding to HTTP requests (not just TCP open)."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/config", timeout=1
+        ) as resp:
+            return resp.status == 200
+    except Exception:
         return False
 
 

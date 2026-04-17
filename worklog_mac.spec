@@ -1,14 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-Work Log Journal - PyInstaller Spec File
-=========================================
-This file configures how PyInstaller packages the application.
+Work Log Journal - PyInstaller Spec File (macOS)
+=================================================
+Produces a .app bundle for macOS distribution.
 
 Usage:
-    pyinstaller --clean worklog.spec
+    pyinstaller --clean worklog_mac.spec
 
 Or simply run:
-    build.bat
+    ./build_mac.sh
 """
 
 import sys
@@ -16,7 +16,6 @@ from pathlib import Path
 
 block_cipher = None
 
-# Get the directory containing this spec file
 SPEC_DIR = Path(SPECPATH)
 
 a = Analysis(
@@ -24,13 +23,9 @@ a = Analysis(
     pathex=[str(SPEC_DIR)],
     binaries=[],
     datas=[
-        # Include app.py as data (imported at runtime)
         ('app.py', '.'),
-        # Include schema for database initialization
         ('schema.sql', '.'),
-        # Include version file
         ('VERSION', '.'),
-        # Include .env.example as template
         ('.env.example', '.'),
     ],
     hiddenimports=[
@@ -95,8 +90,6 @@ a = Analysis(
         'notebook',
         'tkinter.test',
     ],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
 )
@@ -113,14 +106,13 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,  # No console window (GUI app)
+    console=False,
     disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
+    argv_emulation=True,    # macOS: 讓 .app 能接收 Finder 傳來的檔案參數
+    target_arch=None,       # None = 自動偵測目前架構 (arm64/x86_64)
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,  # Add icon path here if you have one: icon='icon.ico'
-    version='version_info.txt' if Path('version_info.txt').exists() else None,
+    icon=None,              # 若有 .icns 圖示，填入路徑：icon='icon.icns'
 )
 
 coll = COLLECT(
@@ -132,4 +124,21 @@ coll = COLLECT(
     upx=True,
     upx_exclude=[],
     name='WorkLog',
+)
+
+# macOS .app bundle
+app = BUNDLE(
+    coll,
+    name='WorkLog.app',
+    icon=None,              # 若有 .icns 圖示，填入路徑：icon='icon.icns'
+    bundle_identifier='com.worklog.journal',
+    info_plist={
+        'CFBundleName': 'WorkLog',
+        'CFBundleDisplayName': 'Work Log Journal',
+        'CFBundleVersion': open('VERSION').read().strip(),
+        'CFBundleShortVersionString': open('VERSION').read().strip(),
+        'NSHighResolutionCapable': True,
+        'LSMinimumSystemVersion': '11.0',
+        'NSRequiresAquaSystemAppearance': False,  # 支援 Dark Mode
+    },
 )

@@ -4,6 +4,33 @@ All notable changes to this project are documented here.
 Format: [Semantic Versioning](https://semver.org)
 
 ---
+## [v1.0.1] — 2026-04-10
+1. 移除所有與Supabase相關的程式碼與功能
+2. 將Pocketbase全部轉移到Postgres，並產生如何部署到VPS的方式
+3. 完整檢查程式碼，並確認資料庫欄位、Word、Excel、PDF輸出欄位與程式碼相符   
+4. Clean build即產生獨立執行檔
+
+## [v1.0.0] — 2026-04-09
+
+##1. 程式碼修改前對前一個版本程式碼先進行完整備份壓縮成.zip，壓縮檔名加註程式版本編號。
+2. 移除Due Time, Enable Reminder選項
+3. 增加Excel輸出組合選項，針對組合選項3.1及3.2，Excel輸出時進行勾選決定輸出組合。3.2組合可選擇所有Due Date或是Week+1
+ 3.1 依照[v0.9.5] — 2026-03-27 保留Excel輸出任務及資料表對應要求，將此任務組合成群組，命名為"WLR"
+ 3.2 增加To-Do欄位輸出成Excel功能，輸出欄位為:Customer, Project Name, Due Date, To-Do，輸出內容依照Due Date排序，每一個項目/行皆有一個Completed勾選方塊。將此任務組合成群組，命名為"To-Do"
+4. 修正若Archieve為Yes, 則WLR Format不需輸出。
+5. Task Summary, Worklogs, Milestone, To-Do內容會自動存檔。若未存檔點擊Cancel或關閉視窗時出現存檔提醒。
+6. 修正核選方塊Archieved -> Archieve。Pocketbase資料欄位Archieve -> Archieved。
+7. 雲端資料庫資料同步(sync)頻率設定為每3分鐘或是當有內容變更時推送(push)至雲端資料庫進行更新。
+8. 顯示WorkLog.db檔案大小於程式主畫面右上方。
+9. 資料依照Last Update排序，日期由新到舊
+
+
+## [v0.9.9] — 2026-04-08
+
+- 程式碼修改前對前一個版本程式碼先進行完整備份壓縮成.zip，壓縮檔名加註程式版本編號。
+- Task Summary, Worklogs, Milestone內容會自動存檔。若未存檔點擊Cancel或關閉視窗時出現存檔提醒。
+- 在Milestone欄位下方增加To-Do欄位，並可設定日期、時間提醒功能。
+- 程式修改後進行程式檢查及測試，然後執行Clean build
 
 ## [v0.9.8] — 2026-03-30
 
@@ -154,5 +181,4 @@ Format: [Semantic Versioning](https://semver.org)
 - [ ] v1.0 — Multi-user authentication (Supabase Row Level Security per user)
 - [ ] v1.0 — Attachment support (non-image files)
 - [ ] v1.0 — Rich-text editor (WYSIWYG instead of Markdown)
-- [ ] v1.1 — Export to PDF
 - [ ] v1.1 — Email / calendar integration

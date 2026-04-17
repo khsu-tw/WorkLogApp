@@ -63,15 +63,25 @@ Open **http://localhost:5000** in your browser.
 ## 📁 Structure
 
 ```
-WorkLog_VSCode/
+WorkLogApp/
 ├── app.py              ← Flask app (backend + frontend)
 ├── launcher.py         ← GUI setup wizard + server control
 ├── requirements.txt
 ├── schema.sql          ← Supabase table schema
 ├── .env.example        ← Credential template
-├── .gitignore
-└── .vscode/
-    ├── settings.json
-    ├── launch.json     ← F5 to run
-    └── extensions.json
+├── docs/               ← Documentation
+│   ├── BUILD_LINUX.md
+│   ├── POCKETBASE_SETUP.md
+│   └── RASPBERRY_PI_POSTGRES_SETUP.md
+├── backup/             ← Version backups
+└── dist/               ← Built executables
 ```
+
+---
+
+## 📚 Documentation
+
+- [CHANGELOG.md](CHANGELOG.md) - Version history and updates
+- [docs/BUILD_LINUX.md](docs/BUILD_LINUX.md) - Linux build instructions
+- [docs/POCKETBASE_SETUP.md](docs/POCKETBASE_SETUP.md) - PocketBase setup guide
+- [docs/RASPBERRY_PI_POSTGRES_SETUP.md](docs/RASPBERRY_PI_POSTGRES_SETUP.md) - PostgreSQL on Raspberry Pi setup

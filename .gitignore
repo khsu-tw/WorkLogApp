@@ -1,13 +1,25 @@
+# Environment & credentials
 .env
+
+# Database files
 *.db
 *.db-shm
 *.db-wal
+
+# Python cache
 __pycache__/
 *.pyc
 .venv/
+
+# Build artifacts
 build/
 dist/
 *.spec.bak
+*.zip
+
+# OS files
 .DS_Store
 Thumbs.db
-CHANGELOG.md
+
+# Backup files
+backup/*.zip
