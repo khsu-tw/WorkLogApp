@@ -72,8 +72,9 @@ WorkLogApp/
 ├── docs/               ← Documentation
 │   ├── BUILD_LINUX.md
 │   ├── POCKETBASE_SETUP.md
-│   └── RASPBERRY_PI_POSTGRES_SETUP.md
-├── backup/             ← Version backups
+│   ├── RASPBERRY_PI_POSTGRES_SETUP.md
+│   └── archive/        ← Legacy docs (v0.9.8)
+├── backup/             ← Version backups (.zip)
 └── dist/               ← Built executables
 ```
 
@@ -83,5 +84,6 @@ WorkLogApp/
 
 - [CHANGELOG.md](CHANGELOG.md) - Version history and updates
 - [docs/BUILD_LINUX.md](docs/BUILD_LINUX.md) - Linux build instructions
-- [docs/POCKETBASE_SETUP.md](docs/POCKETBASE_SETUP.md) - PocketBase setup guide
+- [docs/POCKETBASE_SETUP.md](docs/POCKETBASE_SETUP.md) - PocketBase setup guide (legacy)
 - [docs/RASPBERRY_PI_POSTGRES_SETUP.md](docs/RASPBERRY_PI_POSTGRES_SETUP.md) - PostgreSQL on Raspberry Pi setup
+- [docs/archive/](docs/archive/) - Legacy v0.9.8 migration guides
