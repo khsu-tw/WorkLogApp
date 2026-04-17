@@ -1,10 +1,10 @@
 #!/bin/bash
 # =============================================================================
 # Work Log Journal - Linux/Ubuntu Build Script
-# 產生 WorkLog（Linux 獨立執行檔）
+# Generates WorkLog (Linux standalone executable)
 # =============================================================================
 
-set -e  # 任何指令失敗則立即中止
+set -e  # Exit immediately if any command fails
 
 VERSION=$(cat VERSION)
 DIST_NAME="WorkLog_v${VERSION}_Linux"
@@ -15,37 +15,37 @@ echo " Work Log Journal v${VERSION} - Linux Build"
 echo "============================================"
 echo ""
 
-# ── 1. 確認 Python 環境 ──────────────────────────────────────────────────────
-echo "[1/5] 確認 Python 環境..."
-python3 --version || { echo "錯誤：找不到 python3"; exit 1; }
+# ── 1. Check Python Environment ──────────────────────────────────────────────
+echo "[1/5] Checking Python environment..."
+python3 --version || { echo "Error: python3 not found"; exit 1; }
 
-# ── 2. 安裝/確認依賴套件 ─────────────────────────────────────────────────────
-echo "[2/5] 安裝依賴套件..."
+# ── 2. Install/Check Dependencies ────────────────────────────────────────────
+echo "[2/5] Installing dependencies..."
 pip3 install -r requirements.txt --quiet
 pip3 install pyinstaller --quiet
 
-# ── 3. 清除舊的建置目錄 ──────────────────────────────────────────────────────
-echo "[3/5] 清除舊的建置目錄..."
+# ── 3. Clean Old Build Directories ───────────────────────────────────────────
+echo "[3/5] Cleaning old build directories..."
 python3 clean_build.py
 
-# ── 4. 執行 PyInstaller 建置 ──────────────────────────────────────────────────
-echo "[4/5] 建置 WorkLog..."
+# ── 4. Run PyInstaller Build ──────────────────────────────────────────────────
+echo "[4/5] Building WorkLog..."
 pyinstaller --clean worklog_linux.spec
 
-# ── 5. 封裝成 tar.gz（方便分發）──────────────────────────────────────────────
-echo "[5/5] 封裝成 ${ARCHIVE_NAME}..."
+# ── 5. Package as tar.gz (for distribution) ───────────────────────────────────
+echo "[5/5] Packaging as ${ARCHIVE_NAME}..."
 cd dist
 tar -czf "../${ARCHIVE_NAME}" WorkLog
 cd ..
 
 echo ""
 echo "============================================"
-echo " 建置完成！"
-echo "  執行檔:   dist/WorkLog/WorkLog"
-echo "  封裝檔:   ${ARCHIVE_NAME}"
+echo " Build completed!"
+echo "  Executable:  dist/WorkLog/WorkLog"
+echo "  Package:     ${ARCHIVE_NAME}"
 echo "============================================"
 echo ""
-echo "使用方式："
-echo "  1. 解壓縮: tar -xzf ${ARCHIVE_NAME}"
-echo "  2. 執行:   cd WorkLog && ./WorkLog"
+echo "Usage:"
+echo "  1. Extract: tar -xzf ${ARCHIVE_NAME}"
+echo "  2. Run:     cd WorkLog && ./WorkLog"
 echo "============================================"

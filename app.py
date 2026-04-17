@@ -2843,6 +2843,13 @@ function fillForm(rec) {
       el.addEventListener('input', scheduleAutoSave);
     }
   });
+
+  // Also attach auto-save to Archive checkbox
+  const archiveCheckbox = document.getElementById('f-archive');
+  if (archiveCheckbox) {
+    archiveCheckbox.removeEventListener('change', scheduleAutoSave);
+    archiveCheckbox.addEventListener('change', scheduleAutoSave);
+  }
 }
 
 function formData() {
