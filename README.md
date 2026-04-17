@@ -18,7 +18,7 @@ pip install -r requirements.txt
 
 # 3. Configure (optional — skip to use local SQLite)
 cp .env.example .env
-# Edit .env → paste SUPABASE_URL and SUPABASE_KEY
+# Edit .env → configure PostgreSQL connection if needed
 
 # 4a. Run with setup wizard GUI
 python launcher.py
@@ -31,12 +31,15 @@ Open **http://localhost:5000** in your browser.
 
 ---
 
-## ☁️ Cloud Database (Supabase)
+## ☁️ Cloud Database (PostgreSQL)
 
-1. [supabase.com](https://supabase.com) → New project
-2. SQL Editor → paste `schema.sql` → Run
-3. Project Settings → API → copy **Project URL** and **anon key**
-4. Paste into `.env` or enter in the setup wizard
+See [docs/RASPBERRY_PI_POSTGRES_SETUP.md](docs/RASPBERRY_PI_POSTGRES_SETUP.md) for complete setup guide.
+
+Quick setup:
+1. Install PostgreSQL on your server/VPS
+2. Create database: `CREATE DATABASE worklog;`
+3. Run schema: `psql -U postgres -d worklog -f schema.sql`
+4. Configure connection in `.env` or setup wizard
 
 ---
 
@@ -50,7 +53,7 @@ Open **http://localhost:5000** in your browser.
 
 ## ✨ Features
 
-- **Offline-first**: all reads/writes go to local SQLite; syncs to Supabase in background
+- **Offline-first**: all reads/writes go to local SQLite; syncs to PostgreSQL in background
 - **Auto sync**: every 30 s when online; queues changes when offline
 - **Conflict resolution**: side-by-side diff when both sides edited the same record offline
 - **Worklogs**: timestamped journal with Markdown, nested lists, images (paste/drag/upload)
@@ -67,7 +70,7 @@ WorkLogApp/
 ├── app.py              ← Flask app (backend + frontend)
 ├── launcher.py         ← GUI setup wizard + server control
 ├── requirements.txt
-├── schema.sql          ← Supabase table schema
+├── schema.sql          ← PostgreSQL table schema
 ├── .env.example        ← Credential template
 ├── docs/               ← Documentation
 │   ├── BUILD_LINUX.md

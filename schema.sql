@@ -78,10 +78,10 @@ ALTER TABLE worklog ADD COLUMN IF NOT EXISTS todo_due_date TEXT;
 -- ============================================================================
 --
 -- v1.0.1 Changes:
--- - Renamed from "Supabase Schema" to "PostgreSQL Schema"
+-- - PostgreSQL-first schema design
 -- - Column 'archived' uses correct spelling (was 'archieved' in PocketBase)
 -- - Added additional indexes for performance
--- - Removed Supabase-specific references
+-- - Optimized for PostgreSQL 12+ compatibility
 --
 -- Supported Databases:
 -- - PostgreSQL 12+
