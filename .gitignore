@@ -21,5 +21,9 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Backup files
-backup/*.zip
+# Documentation and backups (not needed in repo)
+docs/
+backup/
+
+# Claude Code configuration
+.claude/

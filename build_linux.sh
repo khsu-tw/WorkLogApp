@@ -30,7 +30,7 @@ python3 clean_build.py
 
 # ── 4. Run PyInstaller Build ──────────────────────────────────────────────────
 echo "[4/5] Building WorkLog..."
-pyinstaller --clean worklog_linux.spec
+pyinstaller --clean docs/build/worklog_linux.spec
 
 # ── 5. Package as tar.gz (for distribution) ───────────────────────────────────
 echo "[5/5] Packaging as ${ARCHIVE_NAME}..."

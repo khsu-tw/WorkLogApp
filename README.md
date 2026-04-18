@@ -69,24 +69,27 @@ Quick setup:
 WorkLogApp/
 ├── app.py              ← Flask app (backend + frontend)
 ├── launcher.py         ← GUI setup wizard + server control
-├── requirements.txt
-├── schema.sql          ← PostgreSQL table schema
+├── requirements.txt    ← Python dependencies
 ├── .env.example        ← Credential template
-├── docs/               ← Documentation
-│   ├── BUILD_LINUX.md
-│   ├── POCKETBASE_SETUP.md
-│   ├── RASPBERRY_PI_POSTGRES_SETUP.md
-│   └── archive/        ← Legacy docs (v0.9.8)
-├── backup/             ← Version backups (.zip)
-└── dist/               ← Built executables
+├── build_win.bat       ← Windows build script
+├── build_linux.sh      ← Linux build script
+├── build_mac.sh        ← macOS build script
+└── clean_build.py      ← Clean build directories
+
+Build files (docs/build/):
+├── worklog.spec        ← Windows PyInstaller spec
+├── worklog_linux.spec  ← Linux PyInstaller spec
+├── worklog_mac.spec    ← macOS PyInstaller spec
+└── schema.sql          ← PostgreSQL table schema
 ```
 
 ---
 
 ## 📚 Documentation
 
-- [CHANGELOG.md](CHANGELOG.md) - Version history and updates
-- [docs/BUILD_LINUX.md](docs/BUILD_LINUX.md) - Linux build instructions
-- [docs/POCKETBASE_SETUP.md](docs/POCKETBASE_SETUP.md) - PocketBase setup guide (legacy)
-- [docs/RASPBERRY_PI_POSTGRES_SETUP.md](docs/RASPBERRY_PI_POSTGRES_SETUP.md) - PostgreSQL on Raspberry Pi setup
-- [docs/archive/](docs/archive/) - Legacy v0.9.8 migration guides
+See [docs/](docs/) directory for:
+- Database schema (schema.sql)
+- Build configurations (.spec files)
+- Setup guides (archived)
+
+**Note:** docs/ and backup/ directories are excluded from Git repository.

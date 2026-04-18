@@ -30,7 +30,7 @@ python3 clean_build.py
 
 # ── 4. Run PyInstaller Build ──────────────────────────────────────────────────
 echo "[4/5] Building WorkLog.app..."
-pyinstaller --clean worklog_mac.spec
+pyinstaller --clean docs/build/worklog_mac.spec
 
 # ── 5. Package as zip (for distribution) ──────────────────────────────────────
 echo "[5/5] Packaging as ${ARCHIVE_NAME}..."

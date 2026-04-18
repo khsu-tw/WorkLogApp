@@ -37,7 +37,7 @@ python clean_build.py
 
 REM ── 4. Run PyInstaller Build ─────────────────────────────────────────────────
 echo [4/5] Building WorkLog.exe...
-pyinstaller --clean worklog.spec
+pyinstaller --clean docs\build\worklog.spec
 if %ERRORLEVEL% NEQ 0 (
     echo Error: PyInstaller build failed
     pause
