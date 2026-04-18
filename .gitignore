@@ -22,7 +22,7 @@ dist/
 Thumbs.db
 
 # Documentation and backups (not needed in repo)
-docs/
+# docs/
 backup/
 
 # Claude Code configuration
