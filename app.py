@@ -808,7 +808,8 @@ class SyncEngine:
                     if k in ("id", "cloud_id", "sync_status", "local_updated_at"):
                         continue
                     if k == "archive":
-                        payload["archived"] = v
+                        # Ensure archive value is always 'Yes' or 'No'
+                        payload["archived"] = "Yes" if v == "Yes" else "No"
                     elif k in self._PG_COLS:
                         payload[k] = v
 
@@ -823,7 +824,9 @@ class SyncEngine:
                             if cloud_lu and local_lu and cloud_lu > local_lu:
                                 cur.execute("SELECT * FROM worklog WHERE id=%s", (int(cloud_id),))
                                 cloud_data = dict(cur.fetchone())
-                                cloud_data["archive"] = cloud_data.pop("archived", "No") or "No"
+                                # Normalize archived value
+                                archived_val = cloud_data.pop("archived", None)
+                                cloud_data["archive"] = "Yes" if archived_val == "Yes" else "No"
                                 db.mark_conflict(local_id, cloud_data)
                                 report["conflicts"] += 1
                                 continue
@@ -879,7 +882,9 @@ class SyncEngine:
         for crow in cloud_rows:
             cloud_id = str(crow["id"])
             # Map pg "archived" → local "archive"
-            crow["archive"] = crow.pop("archived", "No") or "No"
+            archived_val = crow.pop("archived", None)
+            # Normalize: only 'Yes' or 'No', handle NULL/empty/any other value as 'No'
+            crow["archive"] = "Yes" if archived_val == "Yes" else "No"
             for col in ("id", "created_at"):
                 crow.pop(col, None)
 
@@ -2026,7 +2031,7 @@ HTML = r"""<!DOCTYPE html>
   .badge-wip    { background:color-mix(in srgb,var(--yellow) 20%,transparent); color:var(--yellow); }
   .badge-cancel { background:color-mix(in srgb,var(--red) 20%,transparent);    color:var(--red); }
   .badge-other  { background:var(--bg3); color:var(--fg2); }
-  tr.archived td { opacity:.45; text-decoration:line-through; }
+  tr.archived td { opacity:.5; text-decoration:line-through; color:var(--fg2); }
 
   /* ── Modal ── */
   #modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.65);
