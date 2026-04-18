@@ -363,7 +363,12 @@ class ControlWindow(tk.Tk):
             else:
                 db_type = "SQLite (local)"
             self._set_status("Running", GREEN)
-            self._url_lbl.config(text=f"http://localhost:{PORT}  ← click to open")
+            lan_ip = _get_lan_ip()
+            if lan_ip:
+                url_text = f"http://localhost:{PORT}  |  http://{lan_ip}:{PORT}"
+            else:
+                url_text = f"http://localhost:{PORT}"
+            self._url_lbl.config(text=f"{url_text}  ← click to open")
             self._db_lbl.config(text=f"Database: {db_type}")
             if not self._server_started:
                 self._server_started = True
@@ -520,6 +525,16 @@ def _flask_ready(port: int) -> bool:
         return False
 
 
+def _get_lan_ip() -> str:
+    """Return the machine's LAN IP, or empty string if unavailable."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return ""
+
+
 def _run_flask(base_dir: Path, port: int):
     """Launch the Flask app in-process."""
     env = _load_env()
@@ -531,7 +546,7 @@ def _run_flask(base_dir: Path, port: int):
 
     try:
         import app as flask_app
-        flask_app.app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
+        flask_app.app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
     except Exception as e:
         print(f"Flask error: {e}", file=sys.stderr)
 
