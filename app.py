@@ -1641,6 +1641,53 @@ def api_sync_check_schema():
         return jsonify({"ok": False, "error": str(e)})
 
 
+@app.route("/api/env", methods=["GET"])
+def api_env_get():
+    """Return current sync configuration (token value redacted)."""
+    token = os.environ.get("POCKETBASE_TOKEN", POCKETBASE_TOKEN)
+    return jsonify({
+        "POCKETBASE_URL":   os.environ.get("POCKETBASE_URL", POCKETBASE_URL),
+        "POCKETBASE_TOKEN": "••••" if token else "",
+        "POSTGRES_URL":     os.environ.get("POSTGRES_URL", POSTGRES_URL),
+    })
+
+
+@app.route("/api/env", methods=["POST"])
+def api_env_set():
+    """Save sync configuration to .env and reload env vars in-process."""
+    global POCKETBASE_URL, POCKETBASE_TOKEN, POSTGRES_URL
+    data = request.json or {}
+
+    env_path = Path(__file__).parent / ".env"
+    existing: dict = {}
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                existing[k.strip()] = v.strip()
+
+    for key in ("POCKETBASE_URL", "POCKETBASE_TOKEN", "POSTGRES_URL"):
+        if key in data and data[key] != "••••":
+            existing[key] = data[key].strip()
+
+    lines = ["# Work Log Journal — Environment Variables", ""]
+    lines += [f"{k}={v}" for k, v in existing.items()]
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    if "POCKETBASE_URL" in data:
+        POCKETBASE_URL = existing.get("POCKETBASE_URL", "")
+        os.environ["POCKETBASE_URL"] = POCKETBASE_URL
+    if "POCKETBASE_TOKEN" in data and data["POCKETBASE_TOKEN"] != "••••":
+        POCKETBASE_TOKEN = existing.get("POCKETBASE_TOKEN", "")
+        os.environ["POCKETBASE_TOKEN"] = POCKETBASE_TOKEN
+    if "POSTGRES_URL" in data:
+        POSTGRES_URL = existing.get("POSTGRES_URL", "")
+        os.environ["POSTGRES_URL"] = POSTGRES_URL
+
+    return jsonify({"ok": True})
+
+
 @app.route("/api/image/resize", methods=["POST"])
 def api_image_resize():
     """Accept base64 PNG, return resized thumbnail base64."""
@@ -1936,6 +1983,7 @@ HTML = r"""<!DOCTYPE html>
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
   :root {
     --bg:       #0f172a;
     --bg2:      #1e293b;
@@ -1950,8 +1998,9 @@ HTML = r"""<!DOCTYPE html>
     --red:      #f87171;
     --grey:     #64748b;
     --radius:   10px;
-    --font:     'DM Sans', system-ui, sans-serif;
+    --font:     'DM Sans', system-ui, -apple-system, sans-serif;
     --mono:     'JetBrains Mono', monospace;
+    --emoji:    'Noto Color Emoji', 'Segoe UI Emoji', 'Apple Color Emoji', 'Segoe UI Symbol';
   }
   [data-theme="light"] {
     --bg:       #f8fafc;
@@ -1969,7 +2018,7 @@ HTML = r"""<!DOCTYPE html>
   }
   * { box-sizing:border-box; margin:0; padding:0; }
   html,body { height:100%; font-family:var(--font); background:var(--bg); color:var(--fg); }
-  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+  .icon { font-family:var(--emoji), var(--font); font-style:normal; }
 
   /* ── Layout ── */
   #app { display:flex; flex-direction:column; height:100vh; overflow:hidden; }
@@ -2055,27 +2104,33 @@ HTML = r"""<!DOCTYPE html>
   .char-hint { font-size:10px; color:var(--fg2); text-align:right; margin-top:2px; }
 
   /* ── Worklogs editor ── */
-  #wl-tabs { display:flex; gap:4px; margin-bottom:6px; }
-  #wl-edit  { display:block; }
-  #wl-preview { display:none; background:var(--bg); border:1px solid var(--border);
-                border-radius:6px; padding:12px; min-height:200px; font-size:13px; line-height:1.7; }
-  #wl-preview h1 { font-size:1.4em; color:var(--accent); margin:.4em 0; }
-  #wl-preview h2 { font-size:1.2em; color:var(--accent); margin:.3em 0; }
-  #wl-preview h3 { font-size:1em;   color:var(--accent); margin:.2em 0; }
-  #wl-preview strong { font-weight:700; }
-  #wl-preview em { font-style:italic; }
-  #wl-preview code { background:var(--bg3); color:#f472b6; padding:1px 5px;
-                     border-radius:4px; font-family:var(--mono); font-size:.9em; }
+  #wl-tabs, #ps-tabs, #todo-tabs { display:flex; gap:4px; margin-bottom:6px; }
+  #wl-edit, #ps-edit, #todo-edit  { display:block; }
+  #wl-preview, #ps-preview, #todo-preview {
+    display:none; background:var(--bg); border:1px solid var(--border);
+    border-radius:6px; padding:12px; font-size:13px; line-height:1.7; }
+  #wl-preview { min-height:200px; }
+  #ps-preview { min-height:100px; }
+  #todo-preview { min-height:60px; }
+  #wl-preview h1, #ps-preview h1, #todo-preview h1 { font-size:1.4em; color:var(--accent); margin:.4em 0; }
+  #wl-preview h2, #ps-preview h2, #todo-preview h2 { font-size:1.2em; color:var(--accent); margin:.3em 0; }
+  #wl-preview h3, #ps-preview h3, #todo-preview h3 { font-size:1em;   color:var(--accent); margin:.2em 0; }
+  #wl-preview strong, #ps-preview strong, #todo-preview strong { font-weight:700; }
+  #wl-preview em, #ps-preview em, #todo-preview em { font-style:italic; }
+  #wl-preview code, #ps-preview code, #todo-preview code {
+    background:var(--bg3); color:#f472b6; padding:1px 5px;
+    border-radius:4px; font-family:var(--mono); font-size:.9em; }
   #wl-preview .stamp { color:var(--accent); font-weight:700; font-size:.85em; }
-  #wl-preview ul, #wl-preview ol { padding-left:1.5em; margin:.2em 0; }
-  #wl-preview ul li { list-style-type: disc; }
-  #wl-preview ul ul li { list-style-type: circle; }
-  #wl-preview ul ul ul li { list-style-type: square; }
-  #wl-preview ol li { list-style-type: decimal; }
-  #wl-preview ol ol li { list-style-type: lower-alpha; }
-  #wl-preview ol ol ol li { list-style-type: lower-roman; }
-  #wl-preview li { margin:.1em 0; }
-  #wl-preview hr { border:none; border-top:1px solid var(--border); margin:.8em 0; }
+  #wl-preview ul, #wl-preview ol, #ps-preview ul, #ps-preview ol,
+  #todo-preview ul, #todo-preview ol { padding-left:1.5em; margin:.2em 0; }
+  #wl-preview ul li, #ps-preview ul li, #todo-preview ul li { list-style-type: disc; }
+  #wl-preview ul ul li, #ps-preview ul ul li, #todo-preview ul ul li { list-style-type: circle; }
+  #wl-preview ul ul ul li, #ps-preview ul ul ul li, #todo-preview ul ul ul li { list-style-type: square; }
+  #wl-preview ol li, #ps-preview ol li, #todo-preview ol li { list-style-type: decimal; }
+  #wl-preview ol ol li, #ps-preview ol ol li, #todo-preview ol ol li { list-style-type: lower-alpha; }
+  #wl-preview ol ol ol li, #ps-preview ol ol ol li, #todo-preview ol ol ol li { list-style-type: lower-roman; }
+  #wl-preview li, #ps-preview li, #todo-preview li { margin:.1em 0; }
+  #wl-preview hr, #ps-preview hr, #todo-preview hr { border:none; border-top:1px solid var(--border); margin:.8em 0; }
   #wl-preview img { max-width:100%; border-radius:6px; margin:.5em 0; }
   .md-hint { font-size:10.5px; color:var(--fg2); background:var(--bg3);
              padding:5px 10px; border-radius:6px; margin-top:5px; line-height:1.8; }
@@ -2174,21 +2229,21 @@ HTML = r"""<!DOCTYPE html>
 
   <!-- Toolbar -->
   <div id="toolbar">
-    <h1>📋 Work Log</h1>
+    <h1><i class="icon">📋</i> Work Log</h1>
     <span id="db-badge">loading…</span>
-    <button class="btn btn-green"  onclick="openNew()">➕ <span>New</span></button>
-    <button class="btn btn-yellow" onclick="openEdit()">✏️ <span>Edit</span></button>
-    <button class="btn btn-red"    onclick="deleteRecord()">🗑 <span>Delete</span></button>
-    <button class="btn btn-ghost"  onclick="openImport()">📥 <span>Import</span></button>
-    <button class="btn btn-word"   onclick="exportWord()">📄 <span>Word</span></button>
-    <button class="btn btn-ghost"  onclick="exportExcel()">📊 <span>Excel</span></button>
-    <button class="btn btn-ghost"  onclick="exportPdf()">📑 <span>PDF</span></button>
+    <button class="btn btn-green"  onclick="openNew()"><i class="icon">➕</i> <span>New</span></button>
+    <button class="btn btn-yellow" onclick="openEdit()"><i class="icon">✏️</i> <span>Edit</span></button>
+    <button class="btn btn-red"    onclick="deleteRecord()"><i class="icon">🗑</i> <span>Delete</span></button>
+    <button class="btn btn-ghost"  onclick="openImport()"><i class="icon">📥</i> <span>Import</span></button>
+    <button class="btn btn-word"   onclick="exportWord()"><i class="icon">📄</i> <span>Word</span></button>
+    <button class="btn btn-ghost"  onclick="exportExcel()"><i class="icon">📊</i> <span>Excel</span></button>
+    <button class="btn btn-ghost"  onclick="exportPdf()"><i class="icon">📑</i> <span>PDF</span></button>
     <div class="spacer"></div>
     <span id="db-size-badge" style="font-size:10px;color:var(--fg2);margin-right:8px">DB: --</span>
     <span id="egress-badge" style="font-size:10px;color:var(--fg2);margin-right:8px;display:none">Egress: --</span>
     <span id="version-badge">v{{APP_VERSION}} by Keynes Hsu</span>
-    <button class="theme-btn" onclick="cycleTheme()" title="Toggle theme" id="theme-icon">🌙</button>
-    <button class="btn btn-ghost btn-sm" onclick="refreshList()">🔄</button>
+    <button class="theme-btn" onclick="cycleTheme()" title="Toggle theme" id="theme-icon"><i class="icon">🌙</i></button>
+    <button class="btn btn-ghost btn-sm" onclick="refreshList()" title="Refresh"><i class="icon">🔄</i></button>
   </div>
 
   <!-- Filter bar -->
@@ -2216,7 +2271,8 @@ HTML = r"""<!DOCTYPE html>
     <span id="conflict-badge-wrap"></span>
     <div class="spacer"></div>
     <button class="btn btn-ghost btn-sm" onclick="syncNow()" id="sync-btn"
-            title="Sync now">⟳ Sync</button>
+            title="Sync now">↻ Sync</button>
+    <button class="btn btn-ghost btn-sm" onclick="openSyncSettings()" title="Sync settings">⚙ DB</button>
   </div>
 
   <!-- Table -->
@@ -2340,9 +2396,9 @@ HTML = r"""<!DOCTYPE html>
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
             <label style="margin:0">Worklogs</label>
             <div id="wl-tabs">
-              <button class="btn btn-accent btn-sm" onclick="setWlTab('edit')">✏️ Edit</button>
+              <button class="btn btn-accent btn-sm" onclick="setWlTab('edit')"><i class="icon">✏️</i> Edit</button>
               <button class="btn btn-ghost btn-sm" onclick="setWlTab('preview')">👁 Preview</button>
-              <button class="btn btn-ghost btn-sm" onclick="insertStamp()">➕ Add Entry</button>
+              <button class="btn btn-ghost btn-sm" onclick="insertStamp()"><i class="icon">➕</i> Add Entry</button>
             </div>
           </div>
           <div id="wl-edit">
@@ -2371,18 +2427,37 @@ HTML = r"""<!DOCTYPE html>
         </div>
         <!-- Milestone -->
         <div class="form-row form-full">
-          <label>Milestone</label>
-          <textarea id="f-project_schedule" rows="6" placeholder="Project milestones and timeline...&#10;Markdown supported (no preview)."></textarea>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+            <label style="margin:0">Milestone</label>
+            <div id="ps-tabs">
+              <button class="btn btn-accent btn-sm" onclick="setPsTab('edit')"><i class="icon">✏️</i> Edit</button>
+              <button class="btn btn-ghost btn-sm" onclick="setPsTab('preview')">👁 Preview</button>
+            </div>
+          </div>
+          <div id="ps-edit">
+            <textarea id="f-project_schedule" rows="6" placeholder="Project milestones and timeline...&#10;Markdown supported."></textarea>
+          </div>
+          <div id="ps-preview"></div>
           <div class="md-hint">
             <strong>Markdown:</strong>
             <code>**bold**</code> <code>*italic*</code> <code>__underline__</code> <code>~~strikethrough~~</code> <code>`code`</code> &nbsp;|&nbsp;
             <code>- bullet</code> <code>1. list</code>
+            <code>&nbsp;&nbsp;- sub</code> (indent 2 spaces = next level)
           </div>
         </div>
         <!-- To-Do -->
         <div class="form-row form-full">
-          <label>To-Do</label>
-          <textarea id="f-todo_content" rows="3" placeholder="What needs to be done..."></textarea>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+            <label style="margin:0">To-Do</label>
+            <div id="todo-tabs">
+              <button class="btn btn-accent btn-sm" onclick="setTodoTab('edit')"><i class="icon">✏️</i> Edit</button>
+              <button class="btn btn-ghost btn-sm" onclick="setTodoTab('preview')">👁 Preview</button>
+            </div>
+          </div>
+          <div id="todo-edit">
+            <textarea id="f-todo_content" rows="3" placeholder="What needs to be done...&#10;Markdown supported."></textarea>
+          </div>
+          <div id="todo-preview"></div>
         </div>
         <div class="form-row">
           <label>Due Date</label>
@@ -2392,7 +2467,7 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <div id="modal-footer">
       <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-accent" onclick="saveRecord()">💾 Save</button>
+      <button class="btn btn-accent" onclick="saveRecord()"><i class="icon">💾</i> Save</button>
     </div>
   </div>
 </div>
@@ -2400,7 +2475,7 @@ HTML = r"""<!DOCTYPE html>
 <!-- Import Modal -->
 <div id="import-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:110;align-items:center;justify-content:center;padding:12px;flex-direction:column">
   <div style="background:var(--bg2);border-radius:14px;padding:20px;max-width:520px;width:100%;border:1px solid var(--border)">
-    <h2 style="margin-bottom:12px;font-size:15px">📥 Import & Merge</h2>
+    <h2 style="margin-bottom:12px;font-size:15px"><i class="icon">📥</i> Import &amp; Merge</h2>
     <p style="font-size:12px;color:var(--fg2);margin-bottom:10px">
       Upload a JSON export from another Work Log instance. Records with matching
       Customer + Project will have their Worklogs merged.
@@ -2412,10 +2487,55 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Sync Settings Overlay -->
+<div id="sync-settings-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:120;align-items:center;justify-content:center;padding:12px">
+  <div style="background:var(--bg2);border-radius:14px;padding:24px;max-width:460px;width:100%;border:1px solid var(--border)">
+    <h2 style="margin-bottom:4px;font-size:15px">⚙ Sync Settings</h2>
+    <p style="font-size:12px;color:var(--fg2);margin-bottom:16px">設定雲端資料庫連線。變更會立即套用並儲存至 .env。</p>
+
+    <div style="margin-bottom:12px">
+      <label style="display:block;font-size:12px;font-weight:600;margin-bottom:4px">資料庫類型</label>
+      <select id="ss-mode" onchange="onSsModeChange()" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);font-size:13px">
+        <option value="local">SQLite（本機）</option>
+        <option value="pocketbase">PocketBase</option>
+        <option value="postgres">PostgreSQL</option>
+      </select>
+    </div>
+
+    <div id="ss-pb-section">
+      <div style="margin-bottom:10px">
+        <label style="display:block;font-size:12px;font-weight:600;margin-bottom:4px">PocketBase URL</label>
+        <input id="ss-pb-url" type="text" placeholder="http://127.0.0.1:8090"
+               style="width:100%;box-sizing:border-box;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);font-size:13px">
+        <div style="font-size:11px;color:var(--fg2);margin-top:3px">e.g. http://127.0.0.1:8090 或 https://your-pb-server.com</div>
+      </div>
+      <div style="margin-bottom:10px">
+        <label style="display:block;font-size:12px;font-weight:600;margin-bottom:4px">PocketBase Token（選填）</label>
+        <input id="ss-pb-token" type="password" placeholder="留空表示不變更"
+               style="width:100%;box-sizing:border-box;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);font-size:13px">
+      </div>
+    </div>
+
+    <div id="ss-pg-section" style="display:none">
+      <div style="margin-bottom:10px">
+        <label style="display:block;font-size:12px;font-weight:600;margin-bottom:4px">PostgreSQL URL</label>
+        <input id="ss-pg-url" type="text" placeholder="postgresql://user:pass@host:5432/db"
+               style="width:100%;box-sizing:border-box;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);font-size:13px">
+        <div style="font-size:11px;color:var(--fg2);margin-top:3px">格式：postgresql://使用者:密碼@主機IP:5432/資料庫名</div>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn btn-ghost btn-sm" onclick="closeSyncSettings()">Cancel</button>
+      <button class="btn btn-accent btn-sm" onclick="saveSyncSettings()"><i class="icon">💾</i> Save &amp; Apply</button>
+    </div>
+  </div>
+</div>
+
 <!-- Week Selection Modal for Word Export -->
 <div id="week-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:115;align-items:center;justify-content:center;padding:12px">
   <div style="background:var(--bg2);border-radius:14px;padding:20px;max-width:400px;width:100%;border:1px solid var(--border)">
-    <h2 style="margin-bottom:12px;font-size:15px">📄 Export to Word</h2>
+    <h2 style="margin-bottom:12px;font-size:15px"><i class="icon">📄</i> Export to Word</h2>
     <p style="font-size:12px;color:var(--fg2);margin-bottom:12px">
       Select which week's worklogs to include in the report:
     </p>
@@ -2428,7 +2548,7 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end">
       <button class="btn btn-ghost" onclick="closeWeekSelect()">Cancel</button>
-      <button class="btn btn-word" onclick="confirmWeekExport()">📄 Export</button>
+      <button class="btn btn-word" onclick="confirmWeekExport()"><i class="icon">📄</i> Export</button>
     </div>
   </div>
 </div>
@@ -2436,7 +2556,7 @@ HTML = r"""<!DOCTYPE html>
 <!-- Excel Export Options Modal -->
 <div id="excel-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:115;align-items:center;justify-content:center;padding:12px">
   <div style="background:var(--bg2);border-radius:14px;padding:20px;max-width:420px;width:100%;border:1px solid var(--border)">
-    <h2 style="margin-bottom:12px;font-size:15px">📊 Export to Excel</h2>
+    <h2 style="margin-bottom:12px;font-size:15px"><i class="icon">📊</i> Export to Excel</h2>
     <p style="font-size:12px;color:var(--fg2);margin-bottom:14px">
       Select export format:
     </p>
@@ -2474,7 +2594,7 @@ HTML = r"""<!DOCTYPE html>
 
     <div style="display:flex;gap:8px;justify-content:flex-end">
       <button class="btn btn-ghost" onclick="closeExcelSelect()">Cancel</button>
-      <button class="btn btn-accent" onclick="confirmExcelExport()">📊 Export</button>
+      <button class="btn btn-accent" onclick="confirmExcelExport()"><i class="icon">📊</i> Export</button>
     </div>
   </div>
 </div>
@@ -2596,8 +2716,8 @@ function applyTheme(mode) {
   if (mode==='system')
     effective = window.matchMedia('(prefers-color-scheme:dark)').matches ? 'dark':'light';
   document.body.dataset.theme = effective;
-  document.getElementById('theme-icon').textContent =
-    mode==='dark'?'🌙': mode==='light'?'☀️':'⚙️';
+  document.getElementById('theme-icon').innerHTML =
+    mode==='dark'?'<i class="icon">🌙</i>': mode==='light'?'<i class="icon">☀️</i>':'<i class="icon">⚙️</i>';
   document.querySelector('meta[name=theme-color]').content =
     effective==='dark'?'#0f172a':'#f8fafc';
 }
@@ -2928,7 +3048,7 @@ function openNew() {
   document.getElementById('img-preview-area').innerHTML='';
   fillForm({create_date:today(), last_update:today(), status:'Not Started', category:'General', archive:'No'});
   autoWeek();
-  setWlTab('edit');
+  setWlTab('edit'); setPsTab('edit'); setTodoTab('edit');
   openModal('New Record');
 }
 function openEdit() {
@@ -2937,7 +3057,7 @@ function openEdit() {
   if (!rec) return;
   editingId = selectedId;
   fillForm(rec);
-  setWlTab('edit');
+  setWlTab('edit'); setPsTab('edit'); setTodoTab('edit');
   openModal('Edit Record');
 }
 
@@ -2988,10 +3108,34 @@ function setWlTab(tab) {
   document.getElementById('wl-edit').style.display    = tab==='edit'?'block':'none';
   document.getElementById('wl-preview').style.display = tab==='preview'?'block':'none';
   if (tab==='preview') renderPreview();
+  _syncTabBtns('wl-tabs', tab);
 }
 function renderPreview() {
   const md = document.getElementById('f-worklogs').value;
   document.getElementById('wl-preview').innerHTML = parseMarkdown(md);
+}
+function setPsTab(tab) {
+  document.getElementById('ps-edit').style.display    = tab==='edit'?'block':'none';
+  document.getElementById('ps-preview').style.display = tab==='preview'?'block':'none';
+  if (tab==='preview') document.getElementById('ps-preview').innerHTML =
+    parseMarkdown(document.getElementById('f-project_schedule').value);
+  _syncTabBtns('ps-tabs', tab);
+}
+function setTodoTab(tab) {
+  document.getElementById('todo-edit').style.display    = tab==='edit'?'block':'none';
+  document.getElementById('todo-preview').style.display = tab==='preview'?'block':'none';
+  if (tab==='preview') document.getElementById('todo-preview').innerHTML =
+    parseMarkdown(document.getElementById('f-todo_content').value);
+  _syncTabBtns('todo-tabs', tab);
+}
+function _syncTabBtns(containerId, activeTab) {
+  const btns = document.getElementById(containerId)?.querySelectorAll('button');
+  if (!btns) return;
+  btns.forEach(b => {
+    const isEdit = b.textContent.includes('Edit');
+    const active = (activeTab==='edit') === isEdit;
+    b.className = active ? 'btn btn-accent btn-sm' : 'btn btn-ghost btn-sm';
+  });
 }
 
 function insertStamp() {
@@ -3095,53 +3239,65 @@ function parseMarkdown(md) {
   }
 
   // ── Render tokens → HTML ───────────────────────────────────────────────────
-  // Normalise raw indent → level (0-based): every 2 spaces or 1 tab = +1 level.
-  // Stack entries: { tag:'ul'|'ol', level:number }
+  // Stack entries: { tag:'ul'|'ol', level:number, liOpen:boolean }
+  // liOpen tracks whether the current <li> is still open (sub-list may follow).
+  // Sub-lists are emitted INSIDE the parent <li> (not as siblings), producing
+  // valid HTML: <li>text<ul>...</ul></li>
   let html  = '';
   const stack = [];
 
-  function stackTop()  { return stack[stack.length - 1]; }
-  function closeAll()  { while (stack.length) html += `</${stack.pop().tag}>`; }
+  function peekTop() { return stack[stack.length - 1]; }
+
+  function closeTop() {
+    const top = stack[stack.length - 1];
+    if (top.liOpen) { html += '</li>'; top.liOpen = false; }
+    html += `</${stack.pop().tag}>`;
+  }
+
+  function closeAll()  { while (stack.length) closeTop(); }
+
   function closeTo(targetLevel) {
-    while (stack.length && stackTop().level > targetLevel)
-      html += `</${stack.pop().tag}>`;
+    while (stack.length && peekTop().level > targetLevel) closeTop();
   }
 
   for (const tok of tokens) {
     if (tok.type === 'li') {
       const tag   = tok.ordered ? 'ol' : 'ul';
-      const level = Math.floor(tok.indent / 2);   // 0=root, 1=1 indent, 2=2 indents …
-      const top   = stackTop();
+      const level = Math.floor(tok.indent / 2);
+      const top   = peekTop();
 
       if (!top) {
-        // No list open yet — start one
         html += `<${tag}>`;
-        stack.push({tag, level});
+        stack.push({tag, level, liOpen: false});
       } else if (level > top.level) {
-        // Going deeper — always open a new child list
+        // Going deeper — open sub-list inside the current open <li>
         html += `<${tag}>`;
-        stack.push({tag, level});
+        stack.push({tag, level, liOpen: false});
       } else if (level < top.level) {
-        // Going shallower — pop until we match the target level
         closeTo(level);
-        const cur = stackTop();
+        const cur = peekTop();
         if (!cur || cur.level !== level) {
-          // No existing list at this level; open a fresh one
           html += `<${tag}>`;
-          stack.push({tag, level});
+          stack.push({tag, level, liOpen: false});
         } else if (cur.tag !== tag) {
-          // Same level but different list type (ul↔ol) — swap
-          html += `</${stack.pop().tag}><${tag}>`;
-          stack.push({tag, level});
+          closeTop();
+          html += `<${tag}>`;
+          stack.push({tag, level, liOpen: false});
+        } else {
+          if (cur.liOpen) { html += '</li>'; cur.liOpen = false; }
         }
       } else {
-        // Same level — swap tag if type changed (ul↔ol)
+        // Same level
         if (top.tag !== tag) {
-          html += `</${stack.pop().tag}><${tag}>`;
-          stack.push({tag, level});
+          closeTop();
+          html += `<${tag}>`;
+          stack.push({tag, level, liOpen: false});
+        } else {
+          if (top.liOpen) { html += '</li>'; top.liOpen = false; }
         }
       }
-      html += `<li>${inlineM(tok.content)}</li>`;
+      html += `<li>${inlineM(tok.content)}`;
+      peekTop().liOpen = true;
     } else {
       closeAll();
       if      (tok.type === 'stamp') html += `<div class="stamp">${esc(tok.content)}</div>`;
@@ -3536,9 +3692,58 @@ async function updateSyncStatus() {
   }
 }
 
+async function openSyncSettings() {
+  const res = await fetch('/api/env');
+  const d   = await res.json();
+  const pgUrl = d.POSTGRES_URL || '';
+  const pbUrl = d.POCKETBASE_URL || '';
+  if (pgUrl) {
+    document.getElementById('ss-mode').value = 'postgres';
+    document.getElementById('ss-pg-url').value = pgUrl;
+  } else if (pbUrl) {
+    document.getElementById('ss-mode').value = 'pocketbase';
+    document.getElementById('ss-pb-url').value = pbUrl;
+    document.getElementById('ss-pb-token').value = '';
+  } else {
+    document.getElementById('ss-mode').value = 'local';
+  }
+  onSsModeChange();
+  document.getElementById('sync-settings-overlay').style.display = 'flex';
+}
+
+function closeSyncSettings() {
+  document.getElementById('sync-settings-overlay').style.display = 'none';
+}
+
+function onSsModeChange() {
+  const mode = document.getElementById('ss-mode').value;
+  document.getElementById('ss-pb-section').style.display = mode === 'pocketbase' ? '' : 'none';
+  document.getElementById('ss-pg-section').style.display = mode === 'postgres'   ? '' : 'none';
+}
+
+async function saveSyncSettings() {
+  const mode = document.getElementById('ss-mode').value;
+  const payload = { POCKETBASE_URL: '', POCKETBASE_TOKEN: '', POSTGRES_URL: '' };
+  if (mode === 'pocketbase') {
+    payload.POCKETBASE_URL   = document.getElementById('ss-pb-url').value.trim();
+    payload.POCKETBASE_TOKEN = document.getElementById('ss-pb-token').value.trim();
+  } else if (mode === 'postgres') {
+    payload.POSTGRES_URL = document.getElementById('ss-pg-url').value.trim();
+  }
+  const res = await fetch('/api/env', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  const d   = await res.json();
+  if (d.ok) {
+    closeSyncSettings();
+    toast('✅ 設定已儲存，正在重新連線…');
+    setTimeout(checkSyncStatus, 800);
+  } else {
+    toast('❌ 儲存失敗');
+  }
+}
+
 async function syncNow() {
   const btn = document.getElementById('sync-btn');
-  btn.textContent = '⟳ Syncing…'; btn.disabled = true;
+  btn.textContent = '↻ Syncing…'; btn.disabled = true;
   try {
     // First test connectivity and show diagnostics if not configured
     const testRes  = await fetch('/api/sync/test');
@@ -3598,7 +3803,7 @@ async function syncNow() {
     toast('❌ Sync error: ' + e.message + detail);
     console.error('syncNow error', e);
   }
-  finally { btn.textContent = '⟳ Sync'; btn.disabled = false; }
+  finally { btn.textContent = '↻ Sync'; btn.disabled = false; }
 }
 
 // ── Conflict Resolution ───────────────────────────────────────────────────────
@@ -3655,15 +3860,15 @@ async function openConflicts() {
       <div style="display:flex;gap:8px;margin-top:12px">
         <button class="btn btn-yellow btn-sm"
                 onclick="resolveConflict(${c.conflict_id},'local')">
-          ✅ Keep My Version
+          <i class="icon">✅</i> Keep My Version
         </button>
         <button class="btn btn-accent btn-sm"
                 onclick="resolveConflict(${c.conflict_id},'cloud')">
-          ☁️ Use Cloud Version
+          <i class="icon">☁️</i> Use Cloud Version
         </button>
         ${isUnresolvable ? `<button class="btn btn-ghost btn-sm"
                 onclick="resolveConflict(${c.conflict_id},'backup')">
-          💾 Keep Both (Backup)
+          <i class="icon">💾</i> Keep Both (Backup)
         </button>` : ''}
       </div>
     </div>`;
