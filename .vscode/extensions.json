@@ -1,6 +1,8 @@
 {
   "recommendations": [
     "ms-python.python", "ms-python.debugpy", "ms-python.autopep8",
-    "donjayamanne.python-environment-manager", "pkief.material-icon-theme"
+    "donjayamanne.python-environment-manager",
+    "pkief.material-icon-theme",
+    "google.geminicodeassist"
   ]
 }
