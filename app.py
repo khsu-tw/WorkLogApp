@@ -3593,7 +3593,11 @@ async function syncNow() {
       await updateSyncStatus();
       if (data.conflicts) openConflicts();
     }
-  } catch(e) { toast('❌ Sync error: ' + e.message); }
+  } catch(e) {
+    const detail = e.name && e.name !== 'Error' ? ` [${e.name}]` : '';
+    toast('❌ Sync error: ' + e.message + detail);
+    console.error('syncNow error', e);
+  }
   finally { btn.textContent = '⟳ Sync'; btn.disabled = false; }
 }
 
@@ -3617,7 +3621,7 @@ async function openConflicts() {
     return `<div class="conf-field"><strong>${label}:</strong>
       <span class="${diff?'conf-diff':''}">${esc(lv||'—')}</span>
       ${diff ? `<span style="color:var(--fg2)"> ↔ </span>
-      <span class="conf-diff" style="background:color-mix(in srgb,#38bdf8 12%,transparent)">
+      <span class="conf-diff" style="background:rgba(56,189,248,0.15)">
         ${esc(cv||'—')}</span>` : ''}
     </div>`;
   }
@@ -3820,7 +3824,7 @@ def apple_touch_icon():
 
 
 _SW_JS = """\
-const CACHE = 'worklog-v1';
+const CACHE = 'worklog-v2';
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(['/'])));
@@ -3837,7 +3841,10 @@ self.addEventListener('activate', e => {
 });
 
 self.addEventListener('fetch', e => {
-  if (e.request.method !== 'GET') return;
+  if (e.request.method !== 'GET') {
+    e.respondWith(fetch(e.request));
+    return;
+  }
   if (e.request.url.includes('/api/')) {
     e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
     return;
