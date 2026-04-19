@@ -2732,7 +2732,8 @@ function captureFormState() {
     task_summary: document.getElementById('f-task_summary')?.value || '',
     worklogs: document.getElementById('f-worklogs')?.value || '',
     project_schedule: document.getElementById('f-project_schedule')?.value || '',
-    todo_content: document.getElementById('f-todo_content')?.value || ''
+    todo_content: document.getElementById('f-todo_content')?.value || '',
+    archive: document.getElementById('f-archive')?.checked || false
   };
 }
 
@@ -2773,6 +2774,34 @@ function scheduleAutoSave() {
       autoSaveInProgress = false;
     }
   }, 3000); // 3 seconds debounce
+}
+
+async function saveArchiveNow() {
+  if (!editingId || autoSaveInProgress) return;
+  autoSaveInProgress = true;
+  try {
+    const data = formData();
+    const res = await fetch(`/api/records/${editingId}`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(data)
+    });
+    if (res.ok) {
+      initialFormState = captureFormState();
+      const indicator = document.getElementById('auto-save-indicator');
+      if (indicator) {
+        indicator.textContent = '✓ Saved';
+        indicator.style.opacity = '1';
+        setTimeout(() => { indicator.style.opacity = '0'; }, 1500);
+      }
+      const row = records.find(r => r.id === editingId);
+      if (row) { row.archive = data.archive; renderTable(); }
+    }
+  } catch (e) {
+    console.error('Archive save failed:', e);
+  } finally {
+    autoSaveInProgress = false;
+  }
 }
 
 function dateFmt(s) {
@@ -2851,11 +2880,11 @@ function fillForm(rec) {
     }
   });
 
-  // Also attach auto-save to Archive checkbox
+  // Archive checkbox: save immediately (not debounced) to ensure DB is updated
   const archiveCheckbox = document.getElementById('f-archive');
   if (archiveCheckbox) {
-    archiveCheckbox.removeEventListener('change', scheduleAutoSave);
-    archiveCheckbox.addEventListener('change', scheduleAutoSave);
+    archiveCheckbox.removeEventListener('change', saveArchiveNow);
+    archiveCheckbox.addEventListener('change', saveArchiveNow);
   }
 }
 
