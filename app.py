@@ -38,7 +38,7 @@ try:
 except ImportError:
     pass  # python-dotenv not installed — use os environment only
 
-from flask import Flask, request, jsonify, render_template_string, send_file
+from flask import Flask, request, jsonify, render_template_string, send_file, make_response
 
 # ── Optional cloud DB (PocketBase) ──────────────────────────────────────────
 try:
@@ -1933,6 +1933,8 @@ HTML = r"""<!DOCTYPE html>
 <meta name="theme-color" content="#0f172a">
 <title>Work Log Journal</title>
 <link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
 <style>
   :root {
     --bg:       #0f172a;
@@ -3704,6 +3706,10 @@ document.addEventListener('DOMContentLoaded', function() {
 
 boot();
 startSyncPoller();
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
+}
 </script>
 </body>
 </html>"""
@@ -3723,10 +3729,104 @@ def manifest():
         "background_color": "#0f172a",
         "theme_color":      "#0f172a",
         "icons": [
-            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
-            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+            {"src": "/icon-192.png",       "sizes": "192x192", "type": "image/png"},
+            {"src": "/icon-512.png",       "sizes": "512x512", "type": "image/png"},
+            {"src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png"},
         ]
     })
+
+
+def _make_icon_png(size: int) -> bytes:
+    from PIL import Image, ImageDraw, ImageFont
+    img = Image.new("RGBA", (size, size), (15, 23, 42, 255))   # #0f172a bg
+    draw = ImageDraw.Draw(img)
+    m = size // 8
+    draw.rounded_rectangle(
+        [m, m, size - m, size - m],
+        radius=size // 5,
+        fill=(56, 189, 248, 255),   # #38bdf8 accent
+    )
+    font_size = size // 3
+    font = None
+    for path in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ]:
+        try:
+            font = ImageFont.truetype(path, font_size)
+            break
+        except OSError:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+    text = "WL"
+    bbox = draw.textbbox((0, 0), text, font=font)
+    x = (size - (bbox[2] - bbox[0])) // 2 - bbox[0]
+    y = (size - (bbox[3] - bbox[1])) // 2 - bbox[1]
+    draw.text((x, y), text, fill=(15, 23, 42, 255), font=font)
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    buf.seek(0)
+    return buf
+
+
+@app.route("/icon-192.png")
+def icon_192():
+    return send_file(_make_icon_png(192), mimetype="image/png",
+                     max_age=86400, as_attachment=False)
+
+
+@app.route("/icon-512.png")
+def icon_512():
+    return send_file(_make_icon_png(512), mimetype="image/png",
+                     max_age=86400, as_attachment=False)
+
+
+@app.route("/apple-touch-icon.png")
+@app.route("/apple-touch-icon-precomposed.png")
+def apple_touch_icon():
+    return send_file(_make_icon_png(180), mimetype="image/png",
+                     max_age=86400, as_attachment=False)
+
+
+_SW_JS = """\
+const CACHE = 'worklog-v1';
+
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(['/'])));
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
+    )
+  );
+  self.clients.claim();
+});
+
+self.addEventListener('fetch', e => {
+  if (e.request.method !== 'GET') return;
+  if (e.request.url.includes('/api/')) {
+    e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+    return;
+  }
+  e.respondWith(
+    caches.match(e.request).then(cached => cached || fetch(e.request))
+  );
+});
+"""
+
+
+@app.route("/sw.js")
+def service_worker():
+    resp = make_response(_SW_JS)
+    resp.headers["Content-Type"] = "application/javascript"
+    resp.headers["Service-Worker-Allowed"] = "/"
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
