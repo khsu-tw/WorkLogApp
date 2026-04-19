@@ -9,6 +9,7 @@ set -e  # Exit immediately if any command fails
 VERSION=$(cat VERSION)
 DIST_NAME="WorkLog_v${VERSION}_Linux"
 ARCHIVE_NAME="${DIST_NAME}.tar.gz"
+VENV_DIR=".venv_build"
 
 echo "============================================"
 echo " Work Log Journal v${VERSION} - Linux Build"
@@ -19,10 +20,27 @@ echo ""
 echo "[1/5] Checking Python environment..."
 python3 --version || { echo "Error: python3 not found"; exit 1; }
 
+# Ensure python3-venv is available
+if ! python3 -m venv --help &>/dev/null; then
+    echo "  python3-venv not found. Installing..."
+    sudo apt-get install -y python3-venv
+fi
+
+# Create (or reuse) isolated build venv
+if [ ! -d "$VENV_DIR" ]; then
+    echo "  Creating build venv at ${VENV_DIR}..."
+    python3 -m venv "$VENV_DIR"
+fi
+
+# Activate venv — all subsequent pip/python/pyinstaller calls use it
+source "${VENV_DIR}/bin/activate"
+echo "  Using Python: $(which python3)"
+
 # ── 2. Install/Check Dependencies ────────────────────────────────────────────
 echo "[2/5] Installing dependencies..."
-pip3 install -r requirements.txt --quiet
-pip3 install pyinstaller --quiet
+pip install --upgrade pip --quiet
+pip install -r requirements.txt --quiet
+pip install pyinstaller --quiet
 
 # ── 3. Clean Old Build Directories ───────────────────────────────────────────
 echo "[3/5] Cleaning old build directories..."
@@ -37,6 +55,8 @@ echo "[5/5] Packaging as ${ARCHIVE_NAME}..."
 cd dist
 tar -czf "../${ARCHIVE_NAME}" WorkLog
 cd ..
+
+deactivate
 
 echo ""
 echo "============================================"
