@@ -269,7 +269,10 @@ class ControlWindow(tk.Tk):
 
     def _center(self):
         self.update_idletasks()
-        w, h = 360, 260
+        self.geometry("")          # let tkinter size to content
+        self.update_idletasks()
+        w = max(440, self.winfo_reqwidth())
+        h = max(290, self.winfo_reqheight())
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
@@ -291,17 +294,26 @@ class ControlWindow(tk.Tk):
                                      font=("Arial", 11, "bold"), bg=DARK, fg=WHITE)
         self._status_lbl.pack(side="left")
 
-        # URL label — brighter blue, larger font
-        self._url_lbl = tk.Label(self, text="",
-                                  font=("Arial", 10, "underline"), bg=DARK, fg="#60A5FA",
-                                  cursor="hand2")
-        self._url_lbl.pack()
-        self._url_lbl.bind("<Button-1>", lambda _: self._open_browser())
+        # URL labels (local + LAN) — both clickable
+        url_frame = tk.Frame(self, bg=DARK)
+        url_frame.pack(pady=(4, 0))
 
-        # DB label — was #64748B (too dim), now DIM_DARK (#94A3B8)
+        self._url_local_lbl = tk.Label(url_frame, text="",
+                                        font=("Arial", 10, "underline"), bg=DARK, fg="#60A5FA",
+                                        cursor="hand2", anchor="center")
+        self._url_local_lbl.pack()
+        self._url_local_lbl.bind("<Button-1>", lambda _: self._open_browser())
+
+        self._url_lan_lbl = tk.Label(url_frame, text="",
+                                      font=("Arial", 10, "underline"), bg=DARK, fg="#60A5FA",
+                                      cursor="hand2", anchor="center")
+        self._url_lan_lbl.pack()
+        self._url_lan_lbl.bind("<Button-1>", lambda _: self._open_browser_lan())
+
+        # DB label
         self._db_lbl = tk.Label(self, text="",
                                  font=("Arial", 9), bg=DARK, fg=DIM_DARK)
-        self._db_lbl.pack(pady=(4, 0))
+        self._db_lbl.pack(pady=(6, 0))
 
         # Buttons — ttk for native macOS rendering
         btn_frame = tk.Frame(self, bg=DARK)
@@ -364,12 +376,19 @@ class ControlWindow(tk.Tk):
                 db_type = "SQLite (local)"
             self._set_status("Running", GREEN)
             lan_ip = _get_lan_ip()
+            self._url_local_lbl.config(text=f"本機: http://localhost:{PORT}  ← click")
             if lan_ip:
-                url_text = f"http://localhost:{PORT}  |  http://{lan_ip}:{PORT}"
+                self._url_lan_lbl.config(text=f"區網: http://{lan_ip}:{PORT}  ← click")
             else:
-                url_text = f"http://localhost:{PORT}"
-            self._url_lbl.config(text=f"{url_text}  ← click to open")
-            self._db_lbl.config(text=f"Database: {db_type}")
+                self._url_lan_lbl.config(text="")
+            env = _load_env()
+            if env.get("POSTGRES_URL"):
+                db_text = f"資料庫: PostgreSQL ☁"
+            elif env.get("POCKETBASE_URL"):
+                db_text = f"資料庫: PocketBase ☁ → {env['POCKETBASE_URL']}"
+            else:
+                db_text = "資料庫: SQLite (本機)"
+            self._db_lbl.config(text=db_text)
             if not self._server_started:
                 self._server_started = True
                 webbrowser.open(f"http://localhost:{PORT}")
@@ -388,6 +407,11 @@ class ControlWindow(tk.Tk):
 
     def _open_browser(self):
         webbrowser.open(f"http://localhost:{PORT}")
+
+    def _open_browser_lan(self):
+        lan_ip = _get_lan_ip()
+        if lan_ip:
+            webbrowser.open(f"http://{lan_ip}:{PORT}")
 
     def _open_settings(self):
         if messagebox.askyesno(
