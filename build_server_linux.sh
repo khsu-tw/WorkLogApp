@@ -38,7 +38,7 @@ pip install -r requirements.txt --quiet
 pip install pyinstaller --quiet
 
 echo "[3/5] Cleaning old build directories..."
-rm -rf build dist
+python3 clean_build.py WorkLogServer
 
 echo "[4/5] Building WorkLogServer..."
 pyinstaller --clean docs/build/worklog_server_linux.spec

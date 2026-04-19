@@ -1,10 +1,15 @@
-"""Clean build script - removes build and dist directories"""
+"""Clean build script - removes only the target's build/dist subdirectories.
+
+Usage:
+    python3 clean_build.py <target>   # e.g. WorkLog or WorkLogServer
+    python3 clean_build.py            # legacy: removes entire build/ and dist/
+"""
 import shutil
 import os
+import sys
 import time
 
 def remove_dir(path):
-    """Remove directory with retries"""
     if not os.path.exists(path):
         print(f"  {path} does not exist, skipping")
         return True
@@ -14,7 +19,6 @@ def remove_dir(path):
             print(f"  Removing {path}... (attempt {attempt + 1}/3)")
             shutil.rmtree(path, ignore_errors=True)
 
-            # Force remove if still exists
             if os.path.exists(path):
                 import stat
                 def handle_remove_readonly(func, path, exc):
@@ -35,12 +39,19 @@ def remove_dir(path):
     print(f"  [WARNING] Could not fully remove {path}")
     return False
 
+target = sys.argv[1] if len(sys.argv) > 1 else None
+
 print("Cleaning build directories...")
 print()
 
 success = True
-success &= remove_dir("build")
-success &= remove_dir("dist")
+if target:
+    # Only remove this target's subdirectories, leaving other builds intact
+    success &= remove_dir(os.path.join("build", target))
+    success &= remove_dir(os.path.join("dist", target))
+else:
+    success &= remove_dir("build")
+    success &= remove_dir("dist")
 
 print()
 if success:

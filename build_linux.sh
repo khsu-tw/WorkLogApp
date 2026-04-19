@@ -44,7 +44,7 @@ pip install pyinstaller --quiet
 
 # ── 3. Clean Old Build Directories ───────────────────────────────────────────
 echo "[3/5] Cleaning old build directories..."
-python3 clean_build.py
+python3 clean_build.py WorkLog
 
 # ── 4. Run PyInstaller Build ──────────────────────────────────────────────────
 echo "[4/5] Building WorkLog..."
