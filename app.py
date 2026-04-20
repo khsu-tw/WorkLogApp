@@ -93,6 +93,7 @@ except ImportError:
 import sqlite3
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB Flask default
 app.secret_key = os.environ.get("SECRET_KEY", "worklog-dev-key-change-in-prod")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2129,6 +2130,11 @@ HTML = r"""<!DOCTYPE html>
                margin:4px; vertical-align:top; cursor:zoom-in;
                transition:opacity .15s; }
   .img-thumb:hover { opacity:.85; }
+  .file-attach-link { display:inline-flex;align-items:center;gap:4px;
+    padding:2px 8px;border-radius:4px;background:var(--bg3);
+    color:var(--accent);text-decoration:none;font-size:0.9em;
+    border:1px solid var(--border); }
+  .file-attach-link:hover { opacity:.8; }
 
   /* Lightbox */
   #lightbox { display:none; position:fixed; inset:0; z-index:999;
@@ -2390,14 +2396,24 @@ HTML = r"""<!DOCTYPE html>
           </div>
           <div id="wl-edit">
             <textarea id="f-worklogs" rows="12" placeholder="── 2025-03-01 09:00 ──&#10;Write your worklog here…&#10;Markdown supported."></textarea>
-            <div class="paste-zone" id="paste-zone"
-                 onclick="document.getElementById('img-upload').click()"
-                 ondragover="event.preventDefault();this.classList.add('drag-over')"
-                 ondragleave="this.classList.remove('drag-over')"
-                 ondrop="handleDrop(event)">
-              📎 Click or drag & drop to attach an image  •  or Ctrl+V to paste
+            <div style="display:flex;gap:6px;margin-top:4px;">
+              <div class="paste-zone" id="paste-zone" style="flex:1"
+                   onclick="document.getElementById('img-upload').click()"
+                   ondragover="event.preventDefault();this.classList.add('drag-over')"
+                   ondragleave="this.classList.remove('drag-over')"
+                   ondrop="handleDrop(event)">
+                🖼 Image — Click, drag & drop, or Ctrl+V
+              </div>
+              <div class="paste-zone" id="file-zone" style="flex:1"
+                   onclick="document.getElementById('file-upload').click()"
+                   ondragover="event.preventDefault();this.classList.add('drag-over')"
+                   ondragleave="this.classList.remove('drag-over')"
+                   ondrop="handleFileDrop(event)">
+                📎 File — Click or drag & drop (max 5 MB)
+              </div>
             </div>
             <input type="file" id="img-upload" accept="image/*" style="display:none" onchange="handleFileSelect(event)">
+            <input type="file" id="file-upload" style="display:none" onchange="handleNonImageFileSelect(event)">
             <div id="img-preview-area"></div>
           </div>
           <div id="wl-preview" style="display:none"></div>
@@ -2643,7 +2659,8 @@ let sortCol = 'last_update', sortAsc = false;
 let cfg = {};
 let themes = ['dark','light','system'];
 let themeIdx = 0;
-let pendingImages = []; // [{b64, filename}]
+let pendingImages = []; // [{uid, b64}]
+let pendingFiles   = []; // [{uid, name, mimeType, b64, size}]
 let checkedIds = new Set(); // IDs selected for Word export
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
@@ -2824,7 +2841,7 @@ function closeModal() {
   initialFormState = null;
 
   document.getElementById('modal-overlay').classList.remove('open');
-  editingId=null; pendingImages=[];
+  editingId=null; pendingImages=[]; pendingFiles=[];
   document.getElementById('img-preview-area').innerHTML='';
 }
 
@@ -2959,11 +2976,13 @@ function fillForm(rec) {
   updateCharHint(document.getElementById('f-sso_modeln'),'ch-sso');
   updateCharHint(document.getElementById('f-ear'),'ch-ear');
   updateCharHint(document.getElementById('f-application'),'ch-app');
-  // Restore embedded images as UID placeholders + thumbnails with delete buttons
+  // Restore embedded images and files as UID placeholders + chips with delete buttons
   const area = document.getElementById('img-preview-area');
   area.innerHTML = '';
   pendingImages = [];
-  const imgPat = /\[IMG_B64:([A-Za-z0-9+/=]+)\]/g;
+  pendingFiles = [];
+  const imgPat  = /\[IMG_B64:([A-Za-z0-9+/=]+)\]/g;
+  const filePat = /\[FILE:([^\]:\n]+):([^\]:\n]+):([A-Za-z0-9+/=]+)\]/g;
   let wlDisplay = rec.worklogs || '';
   let m;
   while ((m = imgPat.exec(rec.worklogs || '')) !== null) {
@@ -2971,6 +2990,14 @@ function fillForm(rec) {
     pendingImages.push({uid, b64: m[1]});
     wlDisplay = wlDisplay.replace(m[0], `[📷 ${uid}]`);
     _addImageThumb(uid, m[1]);
+  }
+  while ((m = filePat.exec(rec.worklogs || '')) !== null) {
+    const [, name, mimeType, b64] = m;
+    const uid = 'file_' + Math.random().toString(36).slice(2, 10);
+    const size = Math.round(b64.length * 0.75);
+    pendingFiles.push({uid, name, mimeType, b64, size});
+    wlDisplay = wlDisplay.replace(m[0], `[📎 ${uid}]`);
+    _addFileChip(uid, name, size);
   }
   document.getElementById('f-worklogs').value = wlDisplay;
 
@@ -2997,10 +3024,14 @@ function fillForm(rec) {
 
 function formData() {
   const gv = id => document.getElementById(id)?.value||'';
-  // Replace [📷 uid] placeholders with IMG_B64 tokens for DB storage
+  // Replace pending placeholders with stored tokens for DB storage
   let wl = gv('f-worklogs');
   pendingImages.forEach(img => {
     wl = wl.split(`[📷 ${img.uid}]`).join(`[IMG_B64:${img.b64}]`);
+  });
+  pendingFiles.forEach(f => {
+    const safeName = f.name.replace(/:/g, '_');
+    wl = wl.split(`[📎 ${f.uid}]`).join(`[FILE:${safeName}:${f.mimeType}:${f.b64}]`);
   });
   return {
     create_date:  dateOut(gv('f-create_date')),
@@ -3031,7 +3062,7 @@ function today() {
 }
 
 function openNew() {
-  editingId=null; pendingImages=[];
+  editingId=null; pendingImages=[]; pendingFiles=[];
   document.getElementById('img-preview-area').innerHTML='';
   fillForm({create_date:today(), last_update:today(), status:'Not Started', category:'General', archive:'No'});
   autoWeek();
@@ -3177,7 +3208,7 @@ function sortWorklogs() {
 function parseMarkdown(md) {
   if (!md) return '';
 
-  // ── Pre-process: convert [📷 uid] and [IMG_B64:...] to sentinel tokens ──
+  // ── Pre-process: convert image/file tokens to sentinels ──
   // We do this before splitting into lines so multi-char tokens don't confuse things.
   const IMG_TOK = [];
   md = md.replace(/\[📷 (img_[a-z0-9]+)\]/g, (_, uid) => {
@@ -3188,6 +3219,21 @@ function parseMarkdown(md) {
   md = md.replace(/\[IMG_B64:([A-Za-z0-9+/=]+)\]/g, (_, b64) => {
     IMG_TOK.push(`<img src="data:image/png;base64,${b64}" class="img-thumb" onclick="openLightbox(this.src)" style="cursor:pointer">`);
     return `\x00IMG${IMG_TOK.length - 1}\x00`;
+  });
+
+  const FILE_TOK = [];
+  md = md.replace(/\[📎 (file_[a-z0-9]+)\]/g, (_, uid) => {
+    const obj = pendingFiles.find(p => p.uid === uid);
+    if (obj) {
+      FILE_TOK.push(`<a href="data:${obj.mimeType};base64,${obj.b64}" download="${esc(obj.name)}" class="file-attach-link">📎 ${esc(obj.name)}</a>`);
+    } else {
+      FILE_TOK.push('<span style="color:var(--fg2)">[📎]</span>');
+    }
+    return `\x00FILE${FILE_TOK.length - 1}\x00`;
+  });
+  md = md.replace(/\[FILE:([^\]:\n]+):([^\]:\n]+):([A-Za-z0-9+/=]+)\]/g, (_, name, mime, b64) => {
+    FILE_TOK.push(`<a href="data:${mime};base64,${b64}" download="${esc(name)}" class="file-attach-link">📎 ${esc(name)}</a>`);
+    return `\x00FILE${FILE_TOK.length - 1}\x00`;
   });
 
   const lines = md.split('\n');
@@ -3210,6 +3256,9 @@ function parseMarkdown(md) {
 
     if (/^\x00IMG\d+\x00$/.test(rest.trim())) {
       tokens.push({type:'img', indent, content: rest.trim()}); continue;
+    }
+    if (/^\x00FILE\d+\x00$/.test(rest.trim())) {
+      tokens.push({type:'file', indent, content: rest.trim()}); continue;
     }
     if (/^-{3,}$/.test(rest.trim())) {
       tokens.push({type:'hr'}); continue;
@@ -3294,10 +3343,15 @@ function parseMarkdown(md) {
         const imgHtml  = tok.content.replace(/\x00IMG(\d+)\x00/, (_, i) => IMG_TOK[+i] || '');
         html += `<div${style}>${imgHtml}</div>`;
       }
+      else if (tok.type === 'file') {
+        const fileHtml = tok.content.replace(/\x00FILE(\d+)\x00/, (_, i) => FILE_TOK[+i] || '');
+        html += `<div style="margin:4px 0">${fileHtml}</div>`;
+      }
       else if (tok.type === 'hr')    html += '<hr>';
       else if (tok.type === 'h')     html += `<h${tok.level}>${inlineM(tok.content)}</h${tok.level}>`;
       else {
-        const resolved = tok.content.replace(/\x00IMG(\d+)\x00/g, (_, i) => IMG_TOK[+i] || '');
+        let resolved = tok.content.replace(/\x00IMG(\d+)\x00/g, (_, i) => IMG_TOK[+i] || '');
+        resolved = resolved.replace(/\x00FILE(\d+)\x00/g, (_, i) => FILE_TOK[+i] || '');
         const trimmed  = resolved.trim();
         if (trimmed) html += `<p>${inlineM(trimmed)}</p>`;
       }
@@ -3401,6 +3455,65 @@ function removeImage(uid) {
   const ta = document.getElementById('f-worklogs');
   ta.value = ta.value.replace(new RegExp(`\\n?\\[📷 ${uid}\\]\\n?`, 'g'), '\n').trim();
   toast('Image removed');
+}
+
+// ── Non-image file handling ───────────────────────────────────────────────────
+const FILE_SIZE_LIMIT = 5 * 1024 * 1024; // 5 MB
+
+function handleFileDrop(e) {
+  e.preventDefault(); e.target.classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (!file) return;
+  if (file.type.startsWith('image/')) { readAndEmbedImage(file); return; }
+  readAndEmbedFile(file);
+}
+function handleNonImageFileSelect(e) {
+  const file = e.target.files[0];
+  if (file) readAndEmbedFile(file);
+  e.target.value = '';
+}
+function readAndEmbedFile(file) {
+  if (file.size > FILE_SIZE_LIMIT) {
+    toast('File too large (max 5 MB)'); return;
+  }
+  const reader = new FileReader();
+  reader.onload = ev => {
+    const b64 = ev.target.result.split(',')[1];
+    const uid  = 'file_' + Math.random().toString(36).slice(2, 10);
+    const mimeType = file.type || 'application/octet-stream';
+    pendingFiles.push({uid, name: file.name, mimeType, b64, size: file.size});
+    _addFileChip(uid, file.name, file.size);
+    _insertAtCursor(document.getElementById('f-worklogs'), `\n[📎 ${uid}]\n`);
+    toast('📎 File attached');
+  };
+  reader.readAsDataURL(file);
+}
+function _addFileChip(uid, name, size) {
+  const area = document.getElementById('img-preview-area');
+  const chip = document.createElement('div');
+  chip.id = 'thumb_' + uid;
+  chip.style.cssText = 'display:inline-flex;align-items:center;gap:6px;' +
+    'background:var(--bg3);border-radius:6px;padding:4px 8px;margin:3px;font-size:11px;';
+  const sizeKB = (size / 1024).toFixed(1);
+  const lbl = document.createElement('span');
+  lbl.style.color = 'var(--fg)';
+  lbl.textContent = `📎 ${name} (${sizeKB} KB)`;
+  const del = document.createElement('button');
+  del.textContent = '✕';
+  del.title = 'Remove file';
+  del.style.cssText = 'border:none;background:var(--red);color:#fff;border-radius:4px;' +
+    'width:18px;height:18px;cursor:pointer;font-size:10px;padding:0;line-height:1;flex-shrink:0;';
+  del.onclick = () => removeFile(uid);
+  chip.appendChild(lbl); chip.appendChild(del);
+  area.appendChild(chip);
+}
+function removeFile(uid) {
+  pendingFiles = pendingFiles.filter(f => f.uid !== uid);
+  const t = document.getElementById('thumb_' + uid);
+  if (t) t.remove();
+  const ta = document.getElementById('f-worklogs');
+  ta.value = ta.value.replace(new RegExp(`\\n?\\[📎 ${uid}\\]\\n?`, 'g'), '\n').trim();
+  toast('File removed');
 }
 
 // ── Import ────────────────────────────────────────────────────────────────────
