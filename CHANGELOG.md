@@ -1,9 +1,29 @@
 # Work Log Journal — Changelog
 
 All notable changes to this project are documented here.  
-Format: [Semantic Versioning](https://semver.org)
+Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
+
+- **MAJOR** — incompatible API or schema changes
+- **MINOR** — new backward-compatible features
+- **PATCH** — backward-compatible bug fixes
 
 ---
+
+## [v1.0.2] — 2026-04-21
+
+### Added
+- `setup_worklog_autostart.sh` — systemd auto-start setup script for Raspberry Pi 5；執行後自動建立 `/etc/systemd/system/worklog.service`，開機即在背景啟動 WorkLogServer
+- `docs/deploy/DEPLOY_PI5.md` — Pi5 完整部署指南，涵蓋 build、傳檔、解壓、服務設定、管理指令與疑難排解
+
+### Fixed
+- DB 大小 badge 改以實際 `WorkLog.db` 檔案大小為準，不再依 PocketBase 模式切換成 row count 估算值
+
+### Changed
+- `/api/db/size` 後端加入 60 秒 cache，避免每次請求都觸發檔案 I/O
+- 前端 `updateDbSize` 從 `updateSyncStatus`（每 15 秒）拆離，改為獨立每 60 秒輪詢一次
+
+---
+
 ## [v1.0.1] — 2026-04-10
 1. 移除所有與Supabase相關的程式碼與功能
 2. 將Pocketbase全部轉移到Postgres，並產生如何部署到VPS的方式

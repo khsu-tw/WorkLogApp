@@ -1577,30 +1577,16 @@ def api_export_pdf():
         return jsonify({"error": str(e)}), 500
 
 
+_db_size_cache: dict = {"size": None, "bytes": 0, "ts": 0.0}
+_DB_SIZE_TTL = 60  # seconds
+
 @app.route("/api/db/size", methods=["GET"])
 def api_db_size():
-    """Return the PocketBase database table size (estimated) or local SQLite size."""
-    if _pocketbase_configured():
-        try:
-            pb = _cloud_client()
-            # Get total count from PocketBase
-            result = pb.collection(TABLE).get_list(1, 1)
-            row_count = result.total_items if hasattr(result, 'total_items') else 0
-            # Estimate: ~2KB per row average
-            estimated_bytes = row_count * 2048
-
-            if estimated_bytes < 1024:
-                size_str = f"~{estimated_bytes} B"
-            elif estimated_bytes < 1024 * 1024:
-                size_str = f"~{estimated_bytes / 1024:.1f} KB"
-            else:
-                size_str = f"~{estimated_bytes / (1024 * 1024):.2f} MB"
-            return jsonify({"size": size_str + " (PocketBase)", "bytes": estimated_bytes, "rows": row_count})
-        except Exception as e:
-            # Fallback to local size if PocketBase query fails
-            pass
-
-    # Local SQLite size
+    """Return the actual WorkLog.db file size, cached for 60 s."""
+    import time
+    now = time.monotonic()
+    if _db_size_cache["size"] is not None and now - _db_size_cache["ts"] < _DB_SIZE_TTL:
+        return jsonify({"size": _db_size_cache["size"], "bytes": _db_size_cache["bytes"]})
     try:
         size_bytes = os.path.getsize(SQLITE_PATH)
         if size_bytes < 1024:
@@ -1609,7 +1595,8 @@ def api_db_size():
             size_str = f"{size_bytes / 1024:.1f} KB"
         else:
             size_str = f"{size_bytes / (1024 * 1024):.2f} MB"
-        return jsonify({"size": size_str + " (Local)", "bytes": size_bytes})
+        _db_size_cache.update({"size": size_str, "bytes": size_bytes, "ts": now})
+        return jsonify({"size": size_str, "bytes": size_bytes})
     except Exception as e:
         return jsonify({"size": "N/A", "bytes": 0, "error": str(e)})
 
@@ -3642,6 +3629,7 @@ function toast(msg) {
 
 // ── Sync & Offline ────────────────────────────────────────────────────────────
 let _syncInterval = null;
+let _dbSizeInterval = null;
 
 async function updateDbSize() {
   try {
@@ -3656,10 +3644,11 @@ async function updateDbSize() {
 function startSyncPoller() {
   updateSyncStatus();
   _syncInterval = setInterval(updateSyncStatus, 15000);
+  updateDbSize();
+  _dbSizeInterval = setInterval(updateDbSize, 60000);
 }
 
 async function updateSyncStatus() {
-  updateDbSize();
   try {
     const res  = await fetch('/api/sync/status');
     const data = await res.json();
