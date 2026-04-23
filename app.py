@@ -3601,6 +3601,8 @@ async function confirmExcelExport() {
   const format = document.querySelector('input[name="excel-format"]:checked').value;
   const dateFilter = document.querySelector('input[name="date-filter"]:checked').value;
 
+  // Save excelExportIds before closing (which clears excelExportIds)
+  const idsToExport = [...excelExportIds];
   closeExcelSelect();
   toast(`Generating Excel export...`);
 
@@ -3609,7 +3611,7 @@ async function confirmExcelExport() {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
-        ids: excelExportIds,
+        ids: idsToExport,
         format: format,
         date_filter: dateFilter
       })
@@ -3700,14 +3702,16 @@ async function confirmWeekExport() {
   const week = document.getElementById('week-select').value;
   if (week === 'loading') return;
 
+  // Save exportIds before closing (which clears exportIds)
+  const idsToExport = [...exportIds];
   closeWeekSelect();
-  toast(`Generating report for ${exportIds.length} record(s)…`);
+  toast(`Generating report for ${idsToExport.length} record(s)…`);
 
   try {
     const res = await fetch('/api/export/word', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ ids: exportIds, week })
+      body: JSON.stringify({ ids: idsToExport, week })
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({error: res.statusText}));

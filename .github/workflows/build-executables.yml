@@ -1,0 +1,129 @@
+name: Build Executables
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Build Windows executable
+        run: |
+          cd docs/build
+          pyinstaller --clean worklog.spec
+
+      - name: Package Windows build
+        run: |
+          cd docs/build/dist
+          Compress-Archive -Path WorkLog -DestinationPath WorkLog-Windows.zip
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WorkLog-Windows
+          path: docs/build/dist/WorkLog-Windows.zip
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Build Linux executable
+        run: |
+          cd docs/build
+          pyinstaller --clean worklog_linux.spec
+
+      - name: Package Linux build
+        run: |
+          cd docs/build/dist
+          tar -czf WorkLog-Linux.tar.gz WorkLog/
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WorkLog-Linux
+          path: docs/build/dist/WorkLog-Linux.tar.gz
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Build macOS executable
+        run: |
+          cd docs/build
+          pyinstaller --clean worklog_mac.spec
+
+      - name: Package macOS build
+        run: |
+          cd docs/build/dist
+          tar -czf WorkLog-macOS.tar.gz WorkLog.app/
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WorkLog-macOS
+          path: docs/build/dist/WorkLog-macOS.tar.gz
+
+  create-release:
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/WorkLog-Windows/WorkLog-Windows.zip
+            artifacts/WorkLog-Linux/WorkLog-Linux.tar.gz
+            artifacts/WorkLog-macOS/WorkLog-macOS.tar.gz
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
