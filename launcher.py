@@ -521,7 +521,7 @@ def _find_free_port(start: int = 5000, end: int = 5020) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                s.bind(("127.0.0.1", p))
+                s.bind(("0.0.0.0", p))
                 return p          # bind succeeded → port is free
             except OSError:
                 continue
