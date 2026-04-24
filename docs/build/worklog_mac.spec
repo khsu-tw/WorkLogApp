@@ -135,8 +135,8 @@ app = BUNDLE(
     info_plist={
         'CFBundleName': 'WorkLog',
         'CFBundleDisplayName': 'Work Log Journal',
-        'CFBundleVersion': open('../../VERSION').read().strip(),
-        'CFBundleShortVersionString': open('../../VERSION').read().strip(),
+        'CFBundleVersion': (SPEC_DIR / '../../VERSION').read_text().strip(),
+        'CFBundleShortVersionString': (SPEC_DIR / '../../VERSION').read_text().strip(),
         'NSHighResolutionCapable': True,
         'LSMinimumSystemVersion': '11.0',
         'NSRequiresAquaSystemAppearance': False,  # 支援 Dark Mode
