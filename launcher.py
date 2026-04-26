@@ -40,7 +40,8 @@ else:
     APP_DIR  = Path(__file__).parent
     BASE_DIR = Path(__file__).parent
 
-APP_VERSION = "1.0.1"
+_ver_file = BASE_DIR / "VERSION"
+APP_VERSION = _ver_file.read_text(encoding="utf-8").strip() if _ver_file.exists() else "unknown"
 ENV_FILE = APP_DIR / ".env"
 VERSION_FILE = APP_DIR / ".last_version"
 BACKUP_DIR = APP_DIR / "backups"
@@ -103,7 +104,9 @@ class SetupWizard(tk.Toplevel):
 
         # ── DB type radio buttons ────────────────────────────────────────────
         # Use tk.Radiobutton with explicit indicator colors so macOS shows them
-        if existing.get("POSTGRES_URL"):
+        if existing.get("SERVER_URL"):
+            default_mode = "server"
+        elif existing.get("POSTGRES_URL"):
             default_mode = "postgres"
         elif existing.get("POCKETBASE_URL"):
             default_mode = "pocketbase"
@@ -116,6 +119,7 @@ class SetupWizard(tk.Toplevel):
         radio_frame.pack(fill="x", pady=(0, 10))
 
         for val, label in [
+            ("server",     "連線至遠端 WorkLogServer"),
             ("postgres",   "PostgreSQL  (Raspberry Pi / VPS)"),
             ("pocketbase", "PocketBase"),
             ("local",      "僅本機儲存（SQLite）"),
@@ -136,6 +140,21 @@ class SetupWizard(tk.Toplevel):
         self._panel_host = tk.Frame(body, bg=WHITE)
         self._panel_host.pack(fill="x")
         self._panel_host.columnconfigure(0, weight=1)
+
+        # ── Remote WorkLogServer panel ───────────────────────────────────────
+        self._server_frame = tk.Frame(self._panel_host, bg=WHITE, pady=12)
+        self._server_frame.columnconfigure(0, weight=1)
+
+        tk.Label(self._server_frame, text="WorkLogServer URL",
+                 font=("Arial", 10, "bold"), bg=WHITE, fg=TEXT,
+                 anchor="w").grid(row=0, column=0, sticky="w")
+        self._server_url = ttk.Entry(self._server_frame, font=("Arial", 10), width=54)
+        self._server_url.insert(0, existing.get("SERVER_URL", "http://192.168.1.xxx:5000"))
+        self._server_url.grid(row=1, column=0, sticky="ew", pady=(4, 2))
+        tk.Label(self._server_frame,
+                 text="WorkLogServer 運行於 Raspberry Pi 或 VPS 上的 URL",
+                 font=("Arial", 9), bg=WHITE, fg=SUBTEXT,
+                 anchor="w").grid(row=2, column=0, sticky="w")
 
         # ── PostgreSQL panel ─────────────────────────────────────────────────
         self._pg_frame = tk.Frame(self._panel_host, bg=WHITE, pady=12)
@@ -192,7 +211,7 @@ class SetupWizard(tk.Toplevel):
                  font=("Arial", 10), bg=WHITE, fg=TEXT, justify="left").pack(anchor="w")
 
         # All panels in same grid cell — show/hide with grid()/grid_remove()
-        for f in (self._pg_frame, self._pb_frame, self._local_frame):
+        for f in (self._server_frame, self._pg_frame, self._pb_frame, self._local_frame):
             f.grid(row=0, column=0, sticky="ew")
             f.grid_remove()
 
@@ -208,11 +227,14 @@ class SetupWizard(tk.Toplevel):
 
     def _on_mode_change(self):
         """Switch visible panel, then auto-resize the window to fit."""
+        self._server_frame.grid_remove()
         self._pg_frame.grid_remove()
         self._pb_frame.grid_remove()
         self._local_frame.grid_remove()
         mode = self._mode.get()
-        if mode == "postgres":
+        if mode == "server":
+            self._server_frame.grid()
+        elif mode == "postgres":
             self._pg_frame.grid()
         elif mode == "pocketbase":
             self._pb_frame.grid()
@@ -230,20 +252,30 @@ class SetupWizard(tk.Toplevel):
 
     def _save(self):
         mode = self._mode.get()
-        if mode == "postgres":
+        if mode == "server":
             self.result = {
+                "SERVER_URL":      self._server_url.get().strip(),
+                "POSTGRES_URL":    "",
+                "POCKETBASE_URL":  "",
+                "POCKETBASE_TOKEN": "",
+            }
+        elif mode == "postgres":
+            self.result = {
+                "SERVER_URL":      "",
                 "POSTGRES_URL":    self._pg_url.get().strip(),
                 "POCKETBASE_URL":  "",
                 "POCKETBASE_TOKEN": "",
             }
         elif mode == "pocketbase":
             self.result = {
+                "SERVER_URL":      "",
                 "POSTGRES_URL":    "",
                 "POCKETBASE_URL":  self._pb_url.get().strip(),
                 "POCKETBASE_TOKEN": self._pb_token.get().strip(),
             }
         else:
             self.result = {
+                "SERVER_URL":      "",
                 "POSTGRES_URL":    "",
                 "POCKETBASE_URL":  "",
                 "POCKETBASE_TOKEN": "",
@@ -357,6 +389,18 @@ class ControlWindow(tk.Tk):
 
     def _start_server(self):
         global PORT
+        env = _load_env()
+        server_url = env.get("SERVER_URL", "").strip()
+        if server_url:
+            # Remote server mode: skip local Flask, open browser directly
+            self._set_status("已連線至遠端伺服器", GREEN)
+            self._url_local_lbl.config(text=f"伺服器: {server_url}  ← click")
+            self._url_lan_lbl.config(text="")
+            self._db_lbl.config(text=f"WorkLogServer → {server_url}")
+            if not self._server_started:
+                self._server_started = True
+                webbrowser.open(server_url)
+            return
         PORT = _find_free_port()
         self._set_status(f"Starting on port {PORT}…", "#F59E0B")
         self._server_thread = threading.Thread(
@@ -406,9 +450,14 @@ class ControlWindow(tk.Tk):
         self._dot.config(fg=colour)
 
     def _open_browser(self):
-        webbrowser.open(f"http://localhost:{PORT}")
+        env = _load_env()
+        server_url = env.get("SERVER_URL", "").strip()
+        webbrowser.open(server_url if server_url else f"http://localhost:{PORT}")
 
     def _open_browser_lan(self):
+        env = _load_env()
+        if env.get("SERVER_URL", "").strip():
+            return
         lan_ip = _get_lan_ip()
         if lan_ip:
             webbrowser.open(f"http://{lan_ip}:{PORT}")

@@ -9,6 +9,18 @@ Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
 
 ---
 
+## [v1.0.3] — 2026-04-26
+
+### Fixed
+- `launcher.py` 版本號改為從打包的 `VERSION` 檔動態讀取，不再硬編碼，各 OS 執行檔版本號自動與 `VERSION` 同步
+- macOS 建置：加入 `.venv_build` 虛擬環境繞過 Homebrew PEP 668 限制
+- macOS 建置：修正 `VERSION` 路徑在 spec BUNDLE 區塊讀取失敗
+- macOS 建置：修正 tkinter 未打包（需先 `brew install python-tk@3.14`）
+- Port 偵測改以 `0.0.0.0` bind 測試，修正 AirPlay Receiver 佔用 port 5000 時無法自動跳 port 的問題
+
+### Changed
+- Setup Wizard 新增「連線至遠端 WorkLogServer」選項：於 `.env` 設定 `SERVER_URL` 後，Launcher 直接開啟瀏覽器連線至遠端伺服器，不再啟動本機 Flask；適用於 WorkLogServer 單獨部署於 Raspberry Pi 或 VPS 的使用情境
+
 ## [v1.0.2] — 2026-04-21
 
 ### Added
