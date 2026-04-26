@@ -10,6 +10,8 @@ permissions:
   contents: write
 
 jobs:
+  # ── GUI Client Builds ────────────────────────────────────────────────────────
+
   build-windows:
     runs-on: windows-latest
     steps:
@@ -84,6 +86,9 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install tkinter
+        run: brew install python-tk@3.11
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -106,8 +111,76 @@ jobs:
           name: WorkLog-macOS
           path: docs/build/dist/WorkLog-macOS.tar.gz
 
+  # ── WorkLogServer Builds (headless, no GUI) ──────────────────────────────────
+
+  build-linux-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Build WorkLogServer (Linux)
+        run: |
+          cd docs/build
+          pyinstaller --clean worklog_server_linux.spec
+
+      - name: Package Linux server build
+        run: |
+          cd docs/build/dist
+          tar -czf WorkLogServer-Linux.tar.gz WorkLogServer/
+
+      - name: Upload Linux server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WorkLogServer-Linux
+          path: docs/build/dist/WorkLogServer-Linux.tar.gz
+
+  build-macos-server:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Build WorkLogServer (macOS)
+        run: |
+          cd docs/build
+          pyinstaller --clean worklog_server_mac.spec
+
+      - name: Package macOS server build
+        run: |
+          cd docs/build/dist
+          tar -czf WorkLogServer-macOS.tar.gz WorkLogServer/
+
+      - name: Upload macOS server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WorkLogServer-macOS
+          path: docs/build/dist/WorkLogServer-macOS.tar.gz
+
+  # ── Create GitHub Release ────────────────────────────────────────────────────
+
   create-release:
-    needs: [build-windows, build-linux, build-macos]
+    needs: [build-windows, build-linux, build-macos, build-linux-server, build-macos-server]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -125,6 +198,8 @@ jobs:
             artifacts/WorkLog-Windows/WorkLog-Windows.zip
             artifacts/WorkLog-Linux/WorkLog-Linux.tar.gz
             artifacts/WorkLog-macOS/WorkLog-macOS.tar.gz
+            artifacts/WorkLogServer-Linux/WorkLogServer-Linux.tar.gz
+            artifacts/WorkLogServer-macOS/WorkLogServer-macOS.tar.gz
           draft: false
           prerelease: false
           generate_release_notes: true
