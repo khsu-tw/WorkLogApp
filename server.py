@@ -27,6 +27,15 @@ ENV_FILE = APP_DIR / ".env"
 PORT = int(os.environ.get("PORT", 5000))
 
 
+def _read_version() -> str:
+    try:
+        return (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return "0.0.0"
+
+APP_VERSION = _read_version()
+
+
 def _load_env() -> dict:
     env = {}
     if ENV_FILE.exists():
@@ -59,7 +68,7 @@ def main():
     lan_ip = _get_lan_ip()
 
     print("=" * 50)
-    print(" Work Log Journal — Server")
+    print(f" Work Log Journal v{APP_VERSION} — Server")
     print("=" * 50)
     print(f"  Local:  http://localhost:{PORT}")
     if lan_ip:
