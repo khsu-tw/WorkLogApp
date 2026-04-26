@@ -40,8 +40,13 @@ else:
     APP_DIR  = Path(__file__).parent
     BASE_DIR = Path(__file__).parent
 
-_ver_file = BASE_DIR / "VERSION"
-APP_VERSION = _ver_file.read_text(encoding="utf-8").strip() if _ver_file.exists() else "unknown"
+def _read_version() -> str:
+    try:
+        return (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return "0.0.0"
+
+APP_VERSION = _read_version()
 ENV_FILE = APP_DIR / ".env"
 VERSION_FILE = APP_DIR / ".last_version"
 BACKUP_DIR = APP_DIR / "backups"
