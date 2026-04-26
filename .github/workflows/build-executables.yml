@@ -177,10 +177,45 @@ jobs:
           name: WorkLogServer-macOS
           path: docs/build/dist/WorkLogServer-macOS.tar.gz
 
+  build-pi-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU for ARMv7
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Build WorkLogServer for Raspberry Pi (ARMv7)
+        run: |
+          docker run --rm --platform linux/arm/v7 \
+            -v "$PWD:/workspace" -w /workspace \
+            python:3.11-slim-bullseye \
+            bash -c "
+              apt-get update -qq && apt-get install -y -qq libpq-dev gcc build-essential libffi-dev libssl-dev &&
+              pip install --upgrade pip --quiet &&
+              pip install -r requirements.txt --quiet &&
+              pip install pyinstaller --quiet &&
+              cd docs/build &&
+              pyinstaller --clean worklog_server_linux.spec
+            "
+
+      - name: Package Raspberry Pi server build
+        run: |
+          cd docs/build/dist
+          tar -czf WorkLogServer-RaspberryPi.tar.gz WorkLogServer/
+
+      - name: Upload Raspberry Pi server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WorkLogServer-RaspberryPi
+          path: docs/build/dist/WorkLogServer-RaspberryPi.tar.gz
+
   # ── Create GitHub Release ────────────────────────────────────────────────────
 
   create-release:
-    needs: [build-windows, build-linux, build-macos, build-linux-server, build-macos-server]
+    needs: [build-windows, build-linux, build-macos, build-linux-server, build-macos-server, build-pi-server]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -200,6 +235,7 @@ jobs:
             artifacts/WorkLog-macOS/WorkLog-macOS.tar.gz
             artifacts/WorkLogServer-Linux/WorkLogServer-Linux.tar.gz
             artifacts/WorkLogServer-macOS/WorkLogServer-macOS.tar.gz
+            artifacts/WorkLogServer-RaspberryPi/WorkLogServer-RaspberryPi.tar.gz
           draft: false
           prerelease: false
           generate_release_notes: true
