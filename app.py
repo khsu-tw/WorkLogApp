@@ -18,7 +18,7 @@ Run:
 """
 
 import sys
-import os, re, io, json, base64, hashlib, datetime
+import os, re, io, json, base64, hashlib, datetime, tempfile
 from pathlib import Path
 
 # ── Read version from VERSION file (single source of truth) ──────────────────
@@ -1032,32 +1032,132 @@ def api_delete(rid):
 
 @app.route("/api/import", methods=["POST"])
 def api_import():
-    """Accept a JSON array of records and merge into current DB."""
-    rows = request.json or []
-    db = get_db()
-    added = merged = skipped = 0
-    results = []
-    for row in rows:
-        h = make_hash(row.get("customer",""), row.get("project_name",""))
-        existing = db.find_by_hash(h)
-        if existing is None:
-            row.pop("id", None); row["record_hash"] = h
-            db.insert(row); added += 1
-            results.append({"status":"added","customer":row.get("customer",""),
-                            "project":row.get("project_name","")})
-        else:
-            mwl = merge_worklogs(existing.get("worklogs",""), row.get("worklogs",""))
-            if mwl != (existing.get("worklogs","") or ""):
-                upd = dict(existing); eid = upd.pop("id")
-                upd["worklogs"] = mwl; upd["last_update"] = today_str()
-                db.update(eid, upd); merged += 1
-                results.append({"status":"merged","customer":row.get("customer",""),
-                                "project":row.get("project_name","")})
+    """Import all records from an uploaded SQLite database file."""
+    if 'db_file' not in request.files:
+        return jsonify({"error": "未選擇檔案"}), 400
+
+    file = request.files['db_file']
+    if file.filename == '':
+        return jsonify({"error": "檔案名稱為空"}), 400
+
+    if not file.filename.endswith(('.db', '.sqlite', '.sqlite3')):
+        return jsonify({"error": "檔案格式錯誤，僅支援 .db、.sqlite、.sqlite3"}), 400
+
+    temp_fd, temp_path = tempfile.mkstemp(suffix='.db')
+
+    try:
+        # Save uploaded file to temporary location
+        os.close(temp_fd)
+        file.save(temp_path)
+
+        # Connect to the uploaded database
+        conn = sqlite3.connect(temp_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Check if worklog table exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='worklog'")
+        if not cursor.fetchone():
+            conn.close()
+            return jsonify({"error": "資料庫中找不到 'worklog' 資料表"}), 400
+
+        # Fetch all records from the uploaded database
+        cursor.execute("SELECT * FROM worklog")
+        rows = cursor.fetchall()
+        conn.close()
+
+        # Import records into local database
+        db = get_db()
+        added = merged = skipped = 0
+        results = []
+
+        for row in rows:
+            # Convert sqlite3.Row to dict
+            record = dict(row)
+
+            # Normalize field names and values
+            normalized = {}
+            for field in ["week", "due_date", "customer", "project_name", "sso_modeln",
+                          "ear", "application", "bu", "task_summary", "mchp_device",
+                          "project_schedule", "todo_content", "todo_due_date", "status",
+                          "category", "worklogs", "create_date", "last_update"]:
+                normalized[field] = record.get(field, "") or ""
+
+            # Handle different archive field names
+            if "archive" in record:
+                normalized["archive"] = record["archive"] or "No"
+            elif "archieved" in record:
+                normalized["archive"] = record["archieved"] or "No"
             else:
-                skipped += 1
-                results.append({"status":"skipped","customer":row.get("customer",""),
-                                "project":row.get("project_name","")})
-    return jsonify({"added":added,"merged":merged,"skipped":skipped,"results":results})
+                normalized["archive"] = "No"
+
+            # Handle inquiries → mchp_device mapping for old databases
+            if "inquiries" in record and not normalized["mchp_device"]:
+                normalized["mchp_device"] = record["inquiries"] or ""
+
+            # Check if record exists (by customer + project_name)
+            h = make_hash(normalized.get("customer", ""), normalized.get("project_name", ""))
+            existing = db.find_by_hash(h)
+
+            if existing is None:
+                # New record - add it
+                normalized["record_hash"] = h
+                # Remove any extra fields not in schema
+                for key in list(normalized.keys()):
+                    if key not in ["week", "due_date", "customer", "project_name", "sso_modeln",
+                                   "ear", "application", "bu", "task_summary", "mchp_device",
+                                   "project_schedule", "todo_content", "todo_due_date", "status",
+                                   "category", "worklogs", "create_date", "last_update", "archive",
+                                   "record_hash"]:
+                        normalized.pop(key, None)
+                db.insert(normalized)
+                added += 1
+                results.append({
+                    "status": "added",
+                    "customer": normalized.get("customer", ""),
+                    "project": normalized.get("project_name", "")
+                })
+            else:
+                # Existing record - merge worklogs
+                mwl = merge_worklogs(existing.get("worklogs", ""), normalized.get("worklogs", ""))
+                if mwl != (existing.get("worklogs", "") or ""):
+                    upd = dict(existing)
+                    eid = upd.pop("id")
+                    upd["worklogs"] = mwl
+                    upd["last_update"] = today_str()
+                    db.update(eid, upd)
+                    merged += 1
+                    results.append({
+                        "status": "merged",
+                        "customer": normalized.get("customer", ""),
+                        "project": normalized.get("project_name", "")
+                    })
+                else:
+                    skipped += 1
+                    results.append({
+                        "status": "skipped",
+                        "customer": normalized.get("customer", ""),
+                        "project": normalized.get("project_name", "")
+                    })
+
+        return jsonify({
+            "added": added,
+            "merged": merged,
+            "skipped": skipped,
+            "results": results
+        })
+
+    except sqlite3.Error as e:
+        return jsonify({"error": f"讀取資料庫錯誤: {str(e)}"}), 500
+    except Exception as e:
+        return jsonify({"error": f"匯入過程發生錯誤: {str(e)}"}), 500
+    finally:
+        # Clean up temporary file
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except:
+            pass
 
 @app.route("/api/sync/init", methods=["GET"])
 def api_sync_init():
@@ -2478,15 +2578,18 @@ HTML = r"""<!DOCTYPE html>
 <!-- Import Modal -->
 <div id="import-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:110;align-items:center;justify-content:center;padding:12px;flex-direction:column">
   <div style="background:var(--bg2);border-radius:14px;padding:20px;max-width:520px;width:100%;border:1px solid var(--border)">
-    <h2 style="margin-bottom:12px;font-size:15px"><i class="icon">📥</i> Import &amp; Merge</h2>
+    <h2 style="margin-bottom:12px;font-size:15px"><i class="icon">📥</i> 資料庫匯入</h2>
     <p style="font-size:12px;color:var(--fg2);margin-bottom:10px">
-      Upload a JSON export from another Work Log instance. Records with matching
-      Customer + Project will have their Worklogs merged.
+      上傳 SQLite 資料庫檔案（.db）並匯入所有記錄到本機。相同 Customer + Project 的記錄會合併 Worklogs。
     </p>
-    <input type="file" id="import-file" accept=".json" style="margin-bottom:10px">
-    <button class="btn btn-accent" onclick="doImport()">Import</button>
-    <button class="btn btn-ghost" onclick="closeImport()" style="margin-left:8px">Cancel</button>
-    <div id="import-result"></div>
+    <div style="margin-bottom:12px">
+      <label style="display:block;font-size:12px;margin-bottom:6px;color:var(--fg1)">選擇資料庫檔案</label>
+      <input type="file" id="import-db-file" accept=".db,.sqlite,.sqlite3"
+             style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg1);color:var(--fg1);font-size:12px">
+    </div>
+    <button class="btn btn-accent" onclick="doImport()">開始匯入</button>
+    <button class="btn btn-ghost" onclick="closeImport()" style="margin-left:8px">取消</button>
+    <div id="import-result" style="margin-top:12px"></div>
   </div>
 </div>
 
@@ -3518,28 +3621,55 @@ function removeFile(uid) {
 
 // ── Import ────────────────────────────────────────────────────────────────────
 function openImport()  { document.getElementById('import-overlay').style.display='flex'; }
-function closeImport() { document.getElementById('import-overlay').style.display='none'; document.getElementById('import-result').innerHTML=''; }
+function closeImport() {
+  document.getElementById('import-overlay').style.display='none';
+  document.getElementById('import-result').innerHTML='';
+  document.getElementById('import-db-file').value = '';
+}
 
 async function doImport() {
-  const file = document.getElementById('import-file').files[0];
-  if (!file) { toast('Choose a JSON file first'); return; }
-  const text = await file.text();
-  let data;
-  try { data=JSON.parse(text); } catch(e) { toast('Invalid JSON'); return; }
-  const res = await fetch('/api/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-  const result = await res.json();
+  const fileInput = document.getElementById('import-db-file');
+  const file = fileInput.files[0];
+
+  if (!file) { toast('請選擇 .db 檔案'); return; }
+
   const div = document.getElementById('import-result');
-  div.innerHTML = `<div style="margin:8px 0;font-size:12px">
-    ➕ Added: <strong>${result.added}</strong> &nbsp;
-    🔀 Merged: <strong>${result.merged}</strong> &nbsp;
-    ⏭ Skipped: <strong>${result.skipped}</strong>
-  </div>` + result.results.map(r=>`
-    <div class="ir-row ir-${r.status}">
-      <span>${r.status==='added'?'➕':r.status==='merged'?'🔀':'⏭'}</span>
-      <span>${esc(r.customer)}</span>
-      <span style="color:var(--fg2)">${esc(r.project)}</span>
-    </div>`).join('');
-  refreshList();
+  div.innerHTML = '<div style="margin:8px 0;font-size:12px;color:var(--yellow)">⏳ 正在讀取並匯入資料...</div>';
+
+  try {
+    const formData = new FormData();
+    formData.append('db_file', file);
+
+    const res = await fetch('/api/import', {
+      method: 'POST',
+      body: formData
+    });
+
+    const result = await res.json();
+
+    if (!res.ok) {
+      div.innerHTML = `<div style="margin:8px 0;font-size:12px;color:var(--red)">❌ 匯入失敗: ${result.error || '未知錯誤'}</div>`;
+      toast('❌ 匯入失敗');
+      return;
+    }
+
+    div.innerHTML = `<div style="margin:8px 0;font-size:12px">
+      ➕ 新增: <strong>${result.added}</strong> &nbsp;
+      🔀 合併: <strong>${result.merged}</strong> &nbsp;
+      ⏭ 略過: <strong>${result.skipped}</strong>
+    </div>` + (result.results || []).map(r=>`
+      <div class="ir-row ir-${r.status}">
+        <span>${r.status==='added'?'➕':r.status==='merged'?'🔀':'⏭'}</span>
+        <span>${esc(r.customer)}</span>
+        <span style="color:var(--fg2)">${esc(r.project)}</span>
+      </div>`).join('');
+
+    toast(`✅ 匯入完成: ${result.added} 新增, ${result.merged} 合併`);
+    refreshList();
+  } catch (err) {
+    div.innerHTML = `<div style="margin:8px 0;font-size:12px;color:var(--red)">❌ 處理錯誤: ${err.message}</div>`;
+    toast('❌ 處理錯誤');
+  }
 }
 
 // ── Word export ───────────────────────────────────────────────────────────────

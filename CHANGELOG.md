@@ -8,6 +8,16 @@ Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
 - **PATCH** — backward-compatible bug fixes
 
 ---
+## [v1.0.4] — 2026-04-28
+
+### Changed
+- **Import 功能改版**：將原先的 JSON 檔案匯入功能改為 SQLite 資料庫檔案匯入功能
+  - UI 改為檔案上傳，支援 `.db`、`.sqlite`、`.sqlite3` 格式
+  - 上傳資料庫檔案後，自動讀取 `worklog` 資料表的所有記錄並匯入本機
+  - 相同 Customer + Project Name 的記錄會自動合併 Worklogs
+  - 支援 `archieved` → `archive` 欄位映射與舊版 `inquiries` → `mchp_device` 相容
+  - 使用暫存檔案處理上傳，完成後自動清理
+
 
 ## [v1.0.3] — 2026-04-26
 
