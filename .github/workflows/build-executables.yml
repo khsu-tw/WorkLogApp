@@ -36,6 +36,8 @@ jobs:
       - name: Package Windows build
         run: |
           cd docs/build/dist
+          Copy-Item ../launch_debug.bat WorkLog/
+          Copy-Item ../PACKAGE_README.md WorkLog/README.txt
           Compress-Archive -Path WorkLog -DestinationPath WorkLog-Windows.zip
 
       - name: Upload Windows artifact
@@ -68,6 +70,9 @@ jobs:
       - name: Package Linux build
         run: |
           cd docs/build/dist
+          cp ../launch_debug.sh WorkLog/
+          cp ../PACKAGE_README.md WorkLog/README.txt
+          chmod +x WorkLog/launch_debug.sh
           tar -czf WorkLog-Linux.tar.gz WorkLog/
 
       - name: Upload Linux artifact
@@ -103,7 +108,10 @@ jobs:
       - name: Package macOS build
         run: |
           cd docs/build/dist
-          tar -czf WorkLog-macOS.tar.gz WorkLog.app/
+          cp ../launch_debug.sh ./
+          cp ../PACKAGE_README.md README.txt
+          chmod +x launch_debug.sh
+          tar -czf WorkLog-macOS.tar.gz WorkLog.app/ launch_debug.sh README.txt
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
@@ -137,6 +145,9 @@ jobs:
       - name: Package Linux server build
         run: |
           cd docs/build/dist
+          cp ../launch_debug.sh WorkLogServer/
+          cp ../PACKAGE_README.md WorkLogServer/README.txt
+          chmod +x WorkLogServer/launch_debug.sh
           tar -czf WorkLogServer-Linux.tar.gz WorkLogServer/
 
       - name: Upload Linux server artifact
@@ -169,6 +180,9 @@ jobs:
       - name: Package macOS server build
         run: |
           cd docs/build/dist
+          cp ../launch_debug.sh WorkLogServer/
+          cp ../PACKAGE_README.md WorkLogServer/README.txt
+          chmod +x WorkLogServer/launch_debug.sh
           tar -czf WorkLogServer-macOS.tar.gz WorkLogServer/
 
       - name: Upload macOS server artifact
@@ -204,6 +218,9 @@ jobs:
       - name: Package Raspberry Pi server build
         run: |
           cd docs/build/dist
+          cp ../launch_debug.sh WorkLogServer/
+          cp ../PACKAGE_README.md WorkLogServer/README.txt
+          chmod +x WorkLogServer/launch_debug.sh
           tar -czf WorkLogServer-RaspberryPi.tar.gz WorkLogServer/
 
       - name: Upload Raspberry Pi server artifact

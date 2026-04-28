@@ -27,6 +27,8 @@ a = Analysis(
         ('schema.sql', '.'),
         ('../../VERSION', '.'),
         ('../../.env.example', '.'),
+        ('launch_debug.sh', '.'),
+        ('PACKAGE_README.md', 'README.txt'),
     ],
     hiddenimports=[
         # Flask and dependencies

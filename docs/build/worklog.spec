@@ -32,6 +32,9 @@ a = Analysis(
         ('../../VERSION', '.'),
         # Include .env.example as template
         ('../../.env.example', '.'),
+        # Include debug launcher and README
+        ('launch_debug.bat', '.'),
+        ('PACKAGE_README.md', 'README.txt'),
     ],
     hiddenimports=[
         # Flask and dependencies
