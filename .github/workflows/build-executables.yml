@@ -56,6 +56,11 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install system dependencies for Pillow
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zlib1g-dev libjpeg-dev libpng-dev libtiff-dev libfreetype6-dev liblcms2-dev libwebp-dev
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -130,6 +135,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: Install system dependencies for Pillow
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zlib1g-dev libjpeg-dev libpng-dev libtiff-dev libfreetype6-dev liblcms2-dev libwebp-dev
 
       - name: Install dependencies
         run: |
@@ -207,7 +217,7 @@ jobs:
             -v "$PWD:/workspace" -w /workspace \
             python:3.11-slim-bullseye \
             bash -c "
-              apt-get update -qq && apt-get install -y -qq libpq-dev gcc build-essential libffi-dev libssl-dev &&
+              apt-get update -qq && apt-get install -y -qq libpq-dev gcc build-essential libffi-dev libssl-dev zlib1g-dev libjpeg-dev libpng-dev libtiff-dev libfreetype6-dev liblcms2-dev libwebp-dev &&
               pip install --upgrade pip --quiet &&
               pip install -r requirements.txt --quiet &&
               pip install pyinstaller --quiet &&
