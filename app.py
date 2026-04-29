@@ -120,10 +120,10 @@ def _resolve_db_path() -> str:
 SQLITE_PATH = _resolve_db_path()
 
 STATUS_OPTIONS   = ["Not Started","Early Engagement","WIP","Production",
-                    "Cancelled","No More Activity","Task Done"]
+                    "Cancelled","No More Activity","Task Done","Closed"]
 CATEGORY_OPTIONS = ["General","Visit","Training","Tech Support","Design Review",
                     "Debug","Documentation","Design-in","Evaluation","Follow-up",
-                    "Design-win","Others"]
+                    "Design-win","Design Lost","Others"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATABASE — OFFLINE-FIRST HYBRID

@@ -12,6 +12,8 @@ Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
 ## [v1.0.5] — 2026-04-29
 
 ### 🆕 Added
+- **New Status option**: "Closed" added to STATUS field dropdown
+- **New Category option**: "Design Lost" added to CATEGORY field dropdown
 - **Field-level diff detection**: Conflict resolution now shows exactly which fields changed with visual highlighting
   - Orange left border and background highlight on changed fields
   - Badge showing count of changed fields (e.g., "3 fields changed")
