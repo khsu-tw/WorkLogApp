@@ -2208,9 +2208,9 @@ HTML = r"""<!DOCTYPE html>
   tbody td.mchp-device-cell { max-width:150px; white-space:normal; word-wrap:break-word; }
 
   /* v1.0.5: Column width adjustments */
-  thead th:nth-child(7), tbody td:nth-child(7) { width:280px; max-width:280px; } /* Worklogs - wider */
-  thead th:nth-child(8), tbody td:nth-child(8) { width:140px; max-width:140px; } /* Milestone - narrower */
-  thead th:nth-child(9), tbody td:nth-child(9) { width:140px; max-width:140px; } /* To-Do - narrower */
+  thead th:nth-child(8), tbody td:nth-child(8) { width:280px; max-width:280px; } /* Worklogs - wider */
+  thead th:nth-child(9), tbody td:nth-child(9) { width:140px; max-width:140px; } /* Milestone - narrower */
+  thead th:nth-child(10), tbody td:nth-child(10) { width:140px; max-width:140px; } /* To-Do - narrower */
   .badge { display:inline-block; padding:2px 8px; border-radius:20px;
            font-size:10px; font-weight:600; }
   .badge-done   { background:color-mix(in srgb,var(--green) 20%,transparent);  color:var(--green); }
