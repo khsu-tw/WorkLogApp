@@ -35,6 +35,7 @@ Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
 - **Memory leaks**: Fixed uncleaned intervals when modal closed or page navigated
 - **Silent sync failures**: Sync errors now properly caught, logged, and shown to users
 - **Sync timing**: Eliminated up to 60-second delay between save and sync
+- **Update script path issue**: Fixed `update_worklog_server.sh` failing when run with sudo (was using `$HOME` which expands to `/root`)
 
 ### 🏗 Technical Details
 - Added `saveInProgress` flag to coordinate auto-save and manual save

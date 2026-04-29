@@ -21,11 +21,15 @@ set -e  # 遇到錯誤立即退出
 
 # ── 配置區 ──────────────────────────────────────────────────────────────
 
+# 腳本所在目錄（用於計算相對路徑）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 目標目錄（systemd 服務指向的位置）
 TARGET_DIR="/home/khsu/worklog-server"
 
 # 來源目錄（新版本位置）
-SOURCE_DIR="${1:-$HOME/Documents/Github/WorkLogApp/dist/WorkLogServer}"
+# v1.0.5: 修正 - 使用腳本所在目錄而非 $HOME，避免 sudo 時路徑錯誤
+SOURCE_DIR="${1:-${SCRIPT_DIR}/dist/WorkLogServer}"
 
 # 服務名稱
 SERVICE_NAME="worklog.service"
