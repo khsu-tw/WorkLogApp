@@ -2204,13 +2204,13 @@ HTML = r"""<!DOCTYPE html>
   tbody tr.selected { background:color-mix(in srgb, var(--accent) 15%, var(--bg)); }
   tbody td { padding:7px 10px; vertical-align:top; max-width:260px;
              overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  tbody td.wl-cell { white-space:normal; max-height:60px; overflow:hidden; max-width:280px; } /* v1.0.5: Worklogs wider */
+  tbody td.wl-cell { white-space:normal; max-height:60px; overflow:hidden; max-width:280px !important; width:280px !important; } /* v1.0.5: Worklogs wider */
   tbody td.mchp-device-cell { max-width:150px; white-space:normal; word-wrap:break-word; }
 
-  /* v1.0.5: Column width adjustments */
-  thead th:nth-child(8), tbody td:nth-child(8) { width:280px; max-width:280px; } /* Worklogs - wider */
-  thead th:nth-child(9), tbody td:nth-child(9) { width:140px; max-width:140px; } /* Milestone - narrower */
-  thead th:nth-child(10), tbody td:nth-child(10) { width:140px; max-width:140px; } /* To-Do - narrower */
+  /* v1.0.5: Column width adjustments - forced with !important */
+  thead th:nth-child(8), tbody td:nth-child(8) { width:280px !important; max-width:280px !important; min-width:280px !important; } /* Worklogs - wider */
+  thead th:nth-child(9), tbody td:nth-child(9) { width:140px !important; max-width:140px !important; } /* Milestone - narrower */
+  thead th:nth-child(10), tbody td:nth-child(10) { width:140px !important; max-width:140px !important; } /* To-Do - narrower */
   .badge { display:inline-block; padding:2px 8px; border-radius:20px;
            font-size:10px; font-weight:600; }
   .badge-done   { background:color-mix(in srgb,var(--green) 20%,transparent);  color:var(--green); }
