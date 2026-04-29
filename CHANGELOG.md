@@ -29,6 +29,7 @@ Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
 - **Sync interval**: Reduced from 180s (3 min) to 60s (1 min) for faster sync cycles
 - **Auto-save mechanism**: Changed from 3-second debounce to 30-second periodic intervals for predictable behavior
 - **Conflict UI**: Enhanced with field-level diff highlighting and improved visual feedback
+- **Table column widths**: Adjusted for better readability - Worklogs wider (280px), Milestone and To-Do narrower (140px each)
 
 ### 🐛 Fixed
 - **Race conditions**: Fixed data corruption risk from simultaneous auto-save and manual save
