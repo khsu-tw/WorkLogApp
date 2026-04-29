@@ -2204,7 +2204,7 @@ HTML = r"""<!DOCTYPE html>
   tbody tr.selected { background:color-mix(in srgb, var(--accent) 15%, var(--bg)); }
   tbody td { padding:7px 10px; vertical-align:top; max-width:260px;
              overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  tbody td.wl-cell { white-space:normal; max-height:60px; overflow:hidden; max-width:260px; }
+  tbody td.wl-cell { white-space:normal; max-height:60px; overflow:hidden; max-width:280px; } /* v1.0.5: Worklogs wider */
   tbody td.mchp-device-cell { max-width:150px; white-space:normal; word-wrap:break-word; }
 
   /* v1.0.5: Column width adjustments */
