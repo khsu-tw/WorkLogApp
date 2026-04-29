@@ -310,9 +310,19 @@ class LocalDB:
     def mark_conflict(self, local_id, cloud_snapshot: dict, conflict_type: str = "normal"):
         """Store the conflicting cloud version as JSON in a side table.
         conflict_type: 'normal' (timestamp-based) or 'unresolvable' (requires user decision)
+
+        v1.0.5: Enhanced with field-by-field diff detection.
         """
         c = self._conn()
         try:
+            # Get current local version for field comparison
+            local_row = c.execute("SELECT * FROM worklog WHERE id=?", (local_id,)).fetchone()
+            if local_row:
+                local_dict = dict(local_row)
+                # Calculate field differences
+                diff_fields = self._calculate_field_diff(local_dict, cloud_snapshot)
+                cloud_snapshot["_diff_fields"] = diff_fields  # Store diff metadata
+
             c.execute(
                 "INSERT INTO sync_conflicts (local_id, cloud_snapshot, detected_at, conflict_type) VALUES (?,?,?,?)",
                 (local_id, json.dumps(cloud_snapshot),
@@ -321,6 +331,29 @@ class LocalDB:
             c.commit()
         finally:
             c.close()
+
+    def _calculate_field_diff(self, local: dict, cloud: dict) -> list:
+        """Compare local and cloud versions field-by-field.
+        Returns list of field names that differ (v1.0.5).
+        """
+        ignore_fields = {"id", "cloud_id", "sync_status", "local_updated_at", "created", "updated"}
+        diff_fields = []
+
+        # Map cloud "archieved" to local "archive" for comparison
+        cloud_normalized = dict(cloud)
+        if "archieved" in cloud_normalized:
+            cloud_normalized["archive"] = cloud_normalized.pop("archieved")
+
+        all_fields = set(local.keys()) | set(cloud_normalized.keys())
+        for field in all_fields:
+            if field in ignore_fields:
+                continue
+            local_val = str(local.get(field, "")).strip()
+            cloud_val = str(cloud_normalized.get(field, "")).strip()
+            if local_val != cloud_val:
+                diff_fields.append(field)
+
+        return diff_fields
 
     def get_conflicts(self):
         c = self._conn()
@@ -487,12 +520,13 @@ def _postgres_online() -> bool:
 class SyncEngine:
     """
     Background worker:
-      • Every 3 min: checks connectivity, pushes pending rows, pulls remote changes.
+      • Every 60s: checks connectivity, pushes pending rows, pulls remote changes.
+      • Smart sync: skips sync cycle when no pending changes (saves bandwidth).
       • On data change: immediate push to cloud.
       • Conflict = local pending AND cloud version has a newer last_update.
         → stores conflict, flags row; user resolves via /api/sync/conflicts.
     """
-    INTERVAL = 180   # seconds between sync attempts (3 minutes)
+    INTERVAL = 60   # seconds between sync attempts (1 minute, v1.0.5)
 
     def __init__(self):
         self._stop   = _threading.Event()
@@ -559,7 +593,15 @@ class SyncEngine:
 
     def _loop(self):
         while not self._stop.wait(self.INTERVAL):
-            self.sync_now()
+            # Smart sync: skip if no pending changes (v1.0.5 bandwidth optimization)
+            db = _get_local_db()
+            pending_count = len(db.pending_rows())
+            if pending_count > 0:
+                self.sync_now()
+            else:
+                # Still update online status for UI
+                if _is_online():
+                    self._status["online"] = True
 
     def sync_now(self) -> dict:
         if not _is_online():
@@ -2334,6 +2376,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="spacer"></div>
     <span id="db-size-badge" style="font-size:10px;color:var(--fg2);margin-right:8px">DB: --</span>
     <span id="egress-badge" style="font-size:10px;color:var(--fg2);margin-right:8px;display:none">Egress: --</span>
+    <span id="sync-status-badge" style="font-size:10px;color:var(--fg2);margin-right:8px" title="Sync status">⏳ Checking...</span>
     <span id="version-badge">v{{APP_VERSION}} by Keynes Hsu</span>
     <button class="theme-btn" onclick="cycleTheme()" title="Toggle theme" id="theme-icon"><i class="icon">🌙</i></button>
     <button class="btn btn-ghost btn-sm" onclick="refreshList()" title="Refresh"><i class="icon">🔄</i></button>
@@ -2766,6 +2809,36 @@ let pendingImages = []; // [{uid, b64}]
 let pendingFiles   = []; // [{uid, name, mimeType, b64, size}]
 let checkedIds = new Set(); // IDs selected for Word export
 
+// v1.0.5: Update sync status badge in footer
+function updateSyncStatusBadge(status, data = null) {
+  const el = document.getElementById('sync-status-badge');
+  if (!el) return;
+
+  const states = {
+    'synced': { text: '✅ Synced', color: 'var(--green)', title: 'All changes synced' },
+    'syncing': { text: '🔄 Syncing...', color: 'var(--blue)', title: 'Synchronizing with server' },
+    'pending': { text: '⏳ Pending', color: 'var(--orange)', title: 'Changes waiting to sync' },
+    'offline': { text: '📴 Offline', color: 'var(--fg2)', title: 'No connection to server' },
+    'checking': { text: '⏳ Checking...', color: 'var(--fg2)', title: 'Checking sync status' }
+  };
+
+  const state = states[status] || states['checking'];
+  el.textContent = state.text;
+  el.style.color = state.color;
+  el.title = state.title;
+
+  // Add details to tooltip if data provided
+  if (data && status === 'synced') {
+    const details = [];
+    if (data.pushed > 0) details.push(`${data.pushed} pushed`);
+    if (data.pulled > 0) details.push(`${data.pulled} pulled`);
+    if (data.conflicts > 0) details.push(`${data.conflicts} conflicts`);
+    if (details.length > 0) {
+      el.title = `Synced: ${details.join(', ')}`;
+    }
+  }
+}
+
 // ── Boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
   cfg = await fetch('/api/config').then(r=>r.json());
@@ -2779,6 +2852,11 @@ async function boot() {
   // Always show local data first (offline-first: instant load)
   await refreshList();
   document.addEventListener('paste', globalPaste);
+
+  // v1.0.5: Add cleanup handler for page unload
+  window.addEventListener('beforeunload', () => {
+    stopAutoSave();
+  });
 
   // Check if we need an initial cloud pull
   try {
@@ -2938,9 +3016,8 @@ function closeModal() {
     }
   }
 
-  // Clear auto-save state
-  if (autoSaveTimer) clearTimeout(autoSaveTimer);
-  autoSaveTimer = null;
+  // v1.0.5: Clear auto-save state (both interval and timer)
+  stopAutoSave();
   initialFormState = null;
 
   document.getElementById('modal-overlay').classList.remove('open');
@@ -2948,10 +3025,13 @@ function closeModal() {
   document.getElementById('img-preview-area').innerHTML='';
 }
 
-// ── Auto-save State ────────────────────────────────────────────────────────
+// ── Auto-save State (v1.0.5: 30s periodic save with immediate sync) ──────────
 let autoSaveTimer = null;
+let autoSaveInterval = null;
 let autoSaveInProgress = false;
+let saveInProgress = false; // v1.0.5: Prevent race between auto-save and manual save
 let initialFormState = null;
+let syncDebounceTimer = null; // v1.0.5: Debounce sync calls
 
 function captureFormState() {
   if (!editingId) return null; // Only track state for existing records
@@ -2970,12 +3050,19 @@ function hasUnsavedChanges() {
   return JSON.stringify(current) !== JSON.stringify(initialFormState);
 }
 
-function scheduleAutoSave() {
-  if (!editingId) return; // Only auto-save existing records
-  if (autoSaveTimer) clearTimeout(autoSaveTimer);
+function startAutoSave() {
+  // v1.0.5: Start periodic auto-save every 30 seconds during editing
+  if (!editingId) return;
+  stopAutoSave(); // Clear any existing timer
 
-  autoSaveTimer = setTimeout(async () => {
-    if (autoSaveInProgress) return;
+  autoSaveInterval = setInterval(async () => {
+    // v1.0.5: Safety checks to prevent race conditions and memory leaks
+    if (!editingId || autoSaveInProgress || saveInProgress) return;
+    if (!document.getElementById('modal-overlay')?.classList.contains('open')) {
+      stopAutoSave(); // Cleanup if modal closed unexpectedly
+      return;
+    }
+    if (!hasUnsavedChanges()) return; // Skip if no changes
 
     autoSaveInProgress = true;
     try {
@@ -2987,24 +3074,94 @@ function scheduleAutoSave() {
       });
 
       if (res.ok) {
-        initialFormState = captureFormState(); // Update baseline after successful save
+        initialFormState = captureFormState();
         const indicator = document.getElementById('auto-save-indicator');
         if (indicator) {
-          indicator.textContent = '✓ Auto-saved';
+          indicator.textContent = '✓ Auto-saved at ' + new Date().toLocaleTimeString();
           indicator.style.opacity = '1';
-          setTimeout(() => { indicator.style.opacity = '0'; }, 1500);
+          setTimeout(() => { indicator.style.opacity = '0'; }, 2000);
         }
+        // v1.0.5: Trigger debounced sync after auto-save
+        debouncedSync();
       }
     } catch (e) {
       console.error('Auto-save failed:', e);
     } finally {
       autoSaveInProgress = false;
     }
-  }, 3000); // 3 seconds debounce
+  }, 30000); // 30 seconds periodic auto-save
+}
+
+function stopAutoSave() {
+  if (autoSaveInterval) {
+    clearInterval(autoSaveInterval);
+    autoSaveInterval = null;
+  }
+  if (autoSaveTimer) {
+    clearTimeout(autoSaveTimer);
+    autoSaveTimer = null;
+  }
+  if (syncDebounceTimer) {
+    clearTimeout(syncDebounceTimer);
+    syncDebounceTimer = null;
+  }
+  autoSaveInProgress = false;
+  saveInProgress = false;
+}
+
+// v1.0.5: Debounced sync to prevent rapid-fire requests
+function debouncedSync() {
+  if (syncDebounceTimer) clearTimeout(syncDebounceTimer);
+  syncDebounceTimer = setTimeout(() => {
+    triggerSyncWithRetry();
+  }, 1000); // Wait 1s before syncing
+}
+
+// v1.0.5: Sync with retry logic and better error handling
+async function triggerSyncWithRetry(retries = 1) {
+  updateSyncStatusBadge('syncing'); // Show syncing status
+  try {
+    const res = await fetch('/api/sync/now', {method: 'POST'});
+    if (!res.ok) throw new Error(`Sync failed: ${res.status}`);
+    const data = await res.json();
+
+    // Update sync status indicator
+    updateSyncStatusBadge('synced', data);
+    return data;
+  } catch (e) {
+    console.error('Sync error:', e);
+
+    if (retries > 0) {
+      console.log(`Retrying sync... (${retries} attempts left)`);
+      await new Promise(r => setTimeout(r, 2000)); // Wait 2s before retry
+      return triggerSyncWithRetry(retries - 1);
+    }
+
+    // Show non-intrusive error to user after all retries failed
+    updateSyncStatusBadge('offline');
+    const indicator = document.getElementById('auto-save-indicator');
+    if (indicator) {
+      indicator.textContent = '⚠️ Sync pending (offline?)';
+      indicator.style.opacity = '1';
+      indicator.style.color = 'var(--orange)';
+      setTimeout(() => {
+        indicator.style.opacity = '0';
+        indicator.style.color = '';
+      }, 3000);
+    }
+  }
+}
+
+// Legacy function - now just starts the periodic auto-save
+function scheduleAutoSave() {
+  // Keep for compatibility, but now starts interval if not already running
+  if (!autoSaveInterval && editingId) {
+    startAutoSave();
+  }
 }
 
 async function saveArchiveNow() {
-  if (!editingId || autoSaveInProgress) return;
+  if (!editingId || autoSaveInProgress || saveInProgress) return;
   autoSaveInProgress = true;
   try {
     const data = formData();
@@ -3023,6 +3180,8 @@ async function saveArchiveNow() {
       }
       const row = records.find(r => r.id === editingId);
       if (row) { row.archive = data.archive; renderTable(); }
+      // v1.0.5: Trigger debounced sync after archive change
+      debouncedSync();
     }
   } catch (e) {
     console.error('Archive save failed:', e);
@@ -3107,7 +3266,12 @@ function fillForm(rec) {
   // Capture initial state for change detection
   initialFormState = captureFormState();
 
-  // Attach auto-save listeners to monitored fields
+  // v1.0.5: Start periodic auto-save every 30 seconds during editing
+  if (editingId) {
+    startAutoSave();
+  }
+
+  // Attach auto-save listeners to monitored fields (for immediate change detection)
   const autoSaveFields = ['f-task_summary', 'f-worklogs', 'f-project_schedule', 'f-todo_content'];
   autoSaveFields.forEach(fieldId => {
     const el = document.getElementById(fieldId);
@@ -3183,6 +3347,24 @@ function openEdit() {
 }
 
 async function saveRecord() {
+  // v1.0.5: Wait for any in-progress auto-save to complete
+  if (autoSaveInProgress) {
+    await new Promise(resolve => {
+      const checkInterval = setInterval(() => {
+        if (!autoSaveInProgress) {
+          clearInterval(checkInterval);
+          resolve();
+        }
+      }, 100);
+      // Timeout after 5 seconds
+      setTimeout(() => {
+        clearInterval(checkInterval);
+        resolve();
+      }, 5000);
+    });
+  }
+
+  saveInProgress = true; // Prevent auto-save during manual save
   const data = formData();
   const method = editingId ? 'PUT' : 'POST';
   const url    = editingId ? `/api/records/${editingId}` : '/api/records';
@@ -3198,15 +3380,25 @@ async function saveRecord() {
       console.error('Save error:', json);
       return;
     }
-    // Clear auto-save timer and update initial state
-    if (autoSaveTimer) clearTimeout(autoSaveTimer);
+
+    // v1.0.5: Trigger immediate sync with retry after save
+    const syncResult = await triggerSyncWithRetry(2);
+    if (syncResult) {
+      toast(editingId ? '✅ Record updated & synced' : '✅ Record added & synced');
+    } else {
+      toast(editingId ? '✅ Record updated (sync pending)' : '✅ Record added (sync pending)');
+    }
+
+    // Clear auto-save state and update initial state
+    stopAutoSave();
     initialFormState = null; // Reset so closeModal doesn't warn
     closeModal();
     await refreshList();
-    toast(editingId ? '✅ Record updated' : '✅ Record added');
   } catch (e) {
     toast('❌ Network error: ' + e.message);
     console.error(e);
+  } finally {
+    saveInProgress = false;
   }
 }
 
@@ -3908,9 +4100,16 @@ async function updateSyncStatus() {
       dot.className = 'sync-dot sync-online';
       txt.textContent = data.last_sync
         ? `Online — last sync ${data.last_sync}` : 'Online — syncing…';
+      // v1.0.5: Update footer sync badge
+      if (data.pending > 0) {
+        updateSyncStatusBadge('pending');
+      } else {
+        updateSyncStatusBadge('synced');
+      }
     } else {
       dot.className = 'sync-dot sync-offline';
       txt.textContent = 'Offline — changes saved locally';
+      updateSyncStatusBadge('offline');
     }
     pend.textContent = data.pending > 0
       ? `  ${data.pending} pending upload(s)` : '';
@@ -3925,6 +4124,7 @@ async function updateSyncStatus() {
   } catch(e) {
     const dot = document.getElementById('sync-dot');
     if (dot) dot.className = 'sync-dot sync-error';
+    updateSyncStatusBadge('offline');
   }
 }
 
@@ -4055,11 +4255,13 @@ async function openConflicts() {
   }
 
   const fields = ['customer','project_name','status','category',
-                  'task_summary','last_update','due_date'];
+                  'task_summary','work_details','last_update','due_date'];
 
-  function fieldRow(label, lv, cv) {
+  function fieldRow(label, lv, cv, fieldName, diffFields) {
     const diff = (lv||'') !== (cv||'');
-    return `<div class="conf-field"><strong>${label}:</strong>
+    const isChanged = diffFields.includes(fieldName); // v1.0.5: check if field is in diff list
+    const highlightStyle = isChanged ? 'border-left:3px solid #f59e0b;padding-left:8px;background:rgba(245,158,11,0.1)' : '';
+    return `<div class="conf-field" style="${highlightStyle}"><strong>${label}:</strong>
       <span class="${diff?'conf-diff':''}">${esc(lv||'—')}</span>
       ${diff ? `<span style="color:var(--fg2)"> ↔ </span>
       <span class="conf-diff" style="background:rgba(56,189,248,0.15)">
@@ -4070,6 +4272,9 @@ async function openConflicts() {
   list.innerHTML = conflicts.map(c => {
     const cloud = c.cloud_snapshot || {};
     const isUnresolvable = c.conflict_type === 'unresolvable';
+    // v1.0.5: Extract field diff metadata
+    const diffFields = cloud._diff_fields || [];
+    const diffCount = diffFields.length;
     const warningMsg = isUnresolvable
       ? `<div style="background:#7c2d2d;color:#fca5a5;padding:8px 12px;border-radius:6px;margin-bottom:10px;font-size:11px">
           ⚠️ Unable to determine which version is newer. Please choose manually or keep both as backup.
@@ -4081,16 +4286,17 @@ async function openConflicts() {
           detected ${esc(c.detected_at||'')}
         </span>
         ${isUnresolvable ? '<span style="background:#ef4444;color:#fff;padding:2px 6px;border-radius:4px;font-size:9px;margin-left:6px">NEEDS DECISION</span>' : ''}
+        ${diffCount > 0 ? `<span style="background:#f59e0b;color:#fff;padding:2px 6px;border-radius:4px;font-size:9px;margin-left:6px">${diffCount} field${diffCount>1?'s':''} changed</span>` : ''}
       </div>
       ${warningMsg}
       <div style="display:flex;gap:16px">
         <div class="conflict-col local-col">
           <h4>📝 My offline edits</h4>
-          ${fields.map(f => fieldRow(f, c[f], cloud[f])).join('')}
+          ${fields.map(f => fieldRow(f, c[f], cloud[f], f, diffFields)).join('')}
         </div>
         <div class="conflict-col cloud-col">
           <h4>☁️ Cloud version</h4>
-          ${fields.map(f => fieldRow(f, cloud[f], c[f])).join('')}
+          ${fields.map(f => fieldRow(f, cloud[f], c[f], f, diffFields)).join('')}
         </div>
       </div>
       <div style="display:flex;gap:8px;margin-top:12px">

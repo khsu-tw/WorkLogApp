@@ -8,6 +8,44 @@ Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
 - **PATCH** — backward-compatible bug fixes
 
 ---
+
+## [v1.0.5] — 2026-04-29
+
+### 🆕 Added
+- **Field-level diff detection**: Conflict resolution now shows exactly which fields changed with visual highlighting
+  - Orange left border and background highlight on changed fields
+  - Badge showing count of changed fields (e.g., "3 fields changed")
+  - Includes `work_details` field in comparison
+- **Immediate sync on save**: Manual saves and auto-saves trigger immediate sync instead of waiting for the 60s cycle
+- **Smart sync optimization**: Background sync only runs when there are pending changes, saving bandwidth
+- **Retry logic with exponential backoff**: Failed sync attempts automatically retry up to 2 times with 2-second delays
+- **Debounced sync calls**: Sync requests debounced by 1 second to prevent rapid-fire requests
+- **Sync status badge in footer**: Real-time indicator showing ✅ Synced, 🔄 Syncing, ⏳ Pending, or 📴 Offline
+- **Race condition prevention**: Auto-save and manual save operations properly synchronized
+- **Memory leak prevention**: Cleanup handlers for auto-save intervals on page unload and modal close
+- **Better error feedback**: User-visible sync errors with non-intrusive warnings
+
+### 🔧 Changed
+- **Sync interval**: Reduced from 180s (3 min) to 60s (1 min) for faster sync cycles
+- **Auto-save mechanism**: Changed from 3-second debounce to 30-second periodic intervals for predictable behavior
+- **Conflict UI**: Enhanced with field-level diff highlighting and improved visual feedback
+
+### 🐛 Fixed
+- **Race conditions**: Fixed data corruption risk from simultaneous auto-save and manual save
+- **Memory leaks**: Fixed uncleaned intervals when modal closed or page navigated
+- **Silent sync failures**: Sync errors now properly caught, logged, and shown to users
+- **Sync timing**: Eliminated up to 60-second delay between save and sync
+
+### 🏗 Technical Details
+- Added `saveInProgress` flag to coordinate auto-save and manual save
+- Added `syncDebounceTimer` for batching sync requests
+- Implemented `triggerSyncWithRetry()` with retry logic
+- Implemented `debouncedSync()` for preventing rapid requests
+- Added `updateSyncStatusBadge()` for real-time status updates
+- Added cleanup handler in `window.addEventListener('beforeunload')`
+- Enhanced `_calculate_field_diff()` method in LocalDB class
+
+---
 ## [v1.0.4] — 2026-04-28
 
 ### Changed
