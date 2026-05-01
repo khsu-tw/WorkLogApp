@@ -66,6 +66,59 @@ sleep 2
 echo -e "${GREEN}✓ Existing processes stopped${NC}"
 echo ""
 
+# Step 2.5: Check if port is in use
+echo "[2.5/6] Checking if port ${WORKLOG_PORT} is available..."
+PORT_IN_USE=$(lsof -ti:${WORKLOG_PORT} 2>/dev/null || true)
+
+if [ ! -z "${PORT_IN_USE}" ]; then
+    echo -e "${YELLOW}⚠ Port ${WORKLOG_PORT} is currently in use${NC}"
+    echo ""
+    echo "Process details:"
+    ps -p ${PORT_IN_USE} -o pid,user,cmd --no-headers
+    echo ""
+
+    # Ask user if they want to kill the process
+    read -p "Do you want to terminate this process? (Y/n): " -n 1 -r
+    echo ""
+
+    if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
+        echo "Terminating process ${PORT_IN_USE}..."
+        kill -9 ${PORT_IN_USE} 2>/dev/null || true
+        sleep 1
+        echo -e "${GREEN}✓ Process terminated${NC}"
+        echo ""
+    else
+        echo ""
+        echo -e "${YELLOW}Please specify a different port for WorkLogServer:${NC}"
+        read -p "Enter port number (default: 5000): " NEW_PORT
+
+        # Validate port number
+        if [ -z "${NEW_PORT}" ]; then
+            NEW_PORT=5000
+        fi
+
+        if ! [[ "${NEW_PORT}" =~ ^[0-9]+$ ]] || [ "${NEW_PORT}" -lt 1024 ] || [ "${NEW_PORT}" -gt 65535 ]; then
+            echo -e "${RED}Error: Invalid port number. Must be between 1024 and 65535${NC}"
+            exit 1
+        fi
+
+        # Check if new port is also in use
+        NEW_PORT_IN_USE=$(lsof -ti:${NEW_PORT} 2>/dev/null || true)
+        if [ ! -z "${NEW_PORT_IN_USE}" ]; then
+            echo -e "${RED}Error: Port ${NEW_PORT} is also in use${NC}"
+            echo "Please free up the port manually or choose another port"
+            exit 1
+        fi
+
+        WORKLOG_PORT="${NEW_PORT}"
+        echo -e "${GREEN}✓ Will use port ${WORKLOG_PORT}${NC}"
+        echo ""
+    fi
+else
+    echo -e "${GREEN}✓ Port ${WORKLOG_PORT} is available${NC}"
+    echo ""
+fi
+
 # Step 3: Create systemd service file
 echo "[3/6] Creating systemd service file..."
 cat > "${SERVICE_FILE}" << EOF
