@@ -43,6 +43,62 @@ Quick setup:
 
 ---
 
+## 🖥️ Headless Server Deployment (Linux / Raspberry Pi)
+
+For a persistent WorkLogServer running as a systemd service (e.g. on a Raspberry Pi), three scripts work together:
+
+| Script | Purpose | When to run |
+|---|---|---|
+| **`build_server.sh`** | Compiles `WorkLogServer` executable and packages it as a `.tar.gz` | Every time after pulling new code |
+| **`setup_worklog_server_autostart.sh`** | **First-time install** — creates `worklog.service`, enables auto-start on boot, checks port availability | Once per machine |
+| **`update_worklog_server.sh`** | **Subsequent updates** — backs up current version → stops service → replaces binary → preserves `.env` / `*.db` → restarts → auto-rollback on failure | Every version upgrade |
+
+### Unified one-command flow (recommended)
+
+`build_server.sh` supports a `--deploy` flag that auto-detects install state and invokes the correct script:
+
+```bash
+git pull                                       # fetch latest code
+sudo bash build_server.sh --deploy             # build + install (or update)
+```
+
+The `--deploy` flag detects:
+- **First install** → copies binary to `/home/khsu/worklog-server/`, then runs `setup_worklog_server_autostart.sh`
+- **Already installed** → runs `update_worklog_server.sh` (with auto-confirm; full backup + rollback)
+
+Three safety checks are performed automatically:
+1. **Before build** — warns if local `HEAD` differs from `origin/main` (prevents stale builds)
+2. **After build** — verifies bundled `VERSION` matches source `VERSION` (catches PyInstaller cache issues)
+3. **After deploy** — curls `http://localhost:5000/api/config` to confirm the running server reports the expected version
+
+### Standalone usage (scripts still work individually)
+
+```bash
+bash build_server.sh                           # build only, no deploy
+sudo bash setup_worklog_server_autostart.sh    # first install only
+sudo bash update_worklog_server.sh             # update only
+sudo bash diagnose_worklog.sh                  # full health check / troubleshooting
+```
+
+### Deployment decision table
+
+| State on machine | `build_server.sh --deploy` does… |
+|---|---|
+| Fresh machine (no service, no target dir) | build → setup (first install) |
+| `worklog.service` + `/home/khsu/worklog-server/WorkLogServer` both exist | build → update (with backup & rollback) |
+| Service exists but binary missing | build → setup (treated as fresh) |
+
+### Troubleshooting
+
+If the browser still shows an old version after deploy:
+
+1. **Force browser reload**: Ctrl+F5 (PWA/Service Worker may cache old HTML)
+2. **Verify running version**: `curl http://<pi-ip>:5000/api/config | python3 -m json.tool | grep version`
+3. **Check git state**: local modifications may block `git pull`; run `git status` to see
+4. **Full diagnostic**: `sudo bash diagnose_worklog.sh` checks service, port, firewall, logs
+
+---
+
 ## 📱 iOS — Add to Home Screen (PWA)
 
 1. Run on your computer (same WiFi as iPhone)
@@ -69,18 +125,28 @@ Quick setup:
 WorkLogApp/
 ├── app.py              ← Flask app (backend + frontend)
 ├── launcher.py         ← GUI setup wizard + server control
+├── server.py           ← Headless server entry point (no GUI)
 ├── requirements.txt    ← Python dependencies
 ├── .env.example        ← Credential template
-├── build_win.bat       ← Windows build script
-├── build_linux.sh      ← Linux build script
-├── build_mac.sh        ← macOS build script
-└── clean_build.py      ← Clean build directories
+│
+├── build_win.bat       ← Windows build (GUI client)
+├── build_linux.sh      ← Linux build (GUI client)
+├── build_mac.sh        ← macOS build (GUI client)
+├── build_server.sh     ← Universal headless server build (+ optional --deploy)
+├── clean_build.py      ← Clean build directories
+│
+├── setup_worklog_server_autostart.sh  ← First-time systemd install
+├── update_worklog_server.sh           ← Safe version upgrade (backup + rollback)
+├── diagnose_worklog.sh                ← Server health check / troubleshooting
+└── VERSION             ← Single source of truth for the version string
 
 Build files (docs/build/):
-├── worklog.spec        ← Windows PyInstaller spec
-├── worklog_linux.spec  ← Linux PyInstaller spec
-├── worklog_mac.spec    ← macOS PyInstaller spec
-└── schema.sql          ← PostgreSQL table schema
+├── worklog.spec              ← Windows PyInstaller spec (GUI)
+├── worklog_linux.spec        ← Linux PyInstaller spec (GUI)
+├── worklog_mac.spec          ← macOS PyInstaller spec (GUI)
+├── worklog_server_linux.spec ← Headless server PyInstaller spec
+├── worklog_server_mac.spec   ← Headless server (macOS) spec
+└── schema.sql                ← PostgreSQL table schema
 ```
 
 ---
@@ -93,3 +159,4 @@ See [docs/](docs/) directory for:
 - Setup guides (archived)
 
 **Note:** docs/ and backup/ directories are excluded from Git repository.
+
