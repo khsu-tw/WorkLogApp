@@ -161,9 +161,3 @@ See [docs/](docs/) directory for:
 - Setup guides (archived)
 
 **Note:** docs/ and backup/ directories are excluded from Git repository.
-
-部署決策表
-狀態	build_server.sh --deploy 的行為
-全新機器	build → setup (首次安裝)
-已安裝過	build → update (含備份與回滾)
-service 存在但 binary 遺失	build → setup (視為全新)
