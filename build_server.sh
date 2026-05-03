@@ -29,6 +29,21 @@ VERSION=$(cat VERSION)
 ARCH=$(uname -m)          # x86_64, aarch64, armv7l, etc.
 PLATFORM=""
 
+# ── Warn if source tree is behind remote ─────────────────────────────────────
+if [ -d ".git" ]; then
+    git fetch --quiet 2>/dev/null || true
+    LOCAL_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
+    REMOTE_HEAD=$(git rev-parse '@{u}' 2>/dev/null || echo "")
+    if [ -n "$LOCAL_HEAD" ] && [ -n "$REMOTE_HEAD" ] && [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then
+        echo "⚠  WARNING: local HEAD differs from remote — you may not be building the latest code."
+        echo "   Run: git pull    (then re-run this script)"
+        echo ""
+        read -p "Continue anyway with VERSION=${VERSION}? (y/N) " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 1; fi
+    fi
+fi
+
 # ── Detect Platform ──────────────────────────────────────────────────────────
 case "$ARCH" in
     x86_64)
@@ -111,6 +126,18 @@ cd ..
 
 deactivate
 
+# ── Verify version bundled into the build ───────────────────────────────────
+BUNDLED_VERSION=""
+for p in dist/WorkLogServer/_internal/VERSION dist/WorkLogServer/VERSION; do
+    if [ -f "$p" ]; then BUNDLED_VERSION=$(cat "$p" 2>/dev/null); break; fi
+done
+if [ "$BUNDLED_VERSION" != "$VERSION" ]; then
+    echo "⚠  WARNING: bundled VERSION ('${BUNDLED_VERSION}') != source VERSION ('${VERSION}')"
+    echo "   Something is wrong with the build; the deployed server may report the wrong version."
+else
+    echo "  ✓ Bundled VERSION verified: ${BUNDLED_VERSION}"
+fi
+
 echo ""
 echo "============================================"
 echo " ✅ Build completed!"
@@ -147,9 +174,23 @@ if [ "$DEPLOY_MODE" = true ]; then
         chown -R khsu:khsu "${TARGET_DIR}" 2>/dev/null || true
         bash "$(dirname "$0")/setup_worklog_server_autostart.sh"
     fi
+    # Verify the running server reports the expected version
+    sleep 2
+    RUNNING_VERSION=$(curl -s http://localhost:5000/api/config 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('version',''))" 2>/dev/null || echo "")
     echo ""
     echo "============================================"
     echo " ✅ Deploy completed!"
+    echo "============================================"
+    if [ -n "$RUNNING_VERSION" ]; then
+        if [ "$RUNNING_VERSION" = "$VERSION" ]; then
+            echo "  ✓ Running server reports version: ${RUNNING_VERSION}"
+        else
+            echo "  ⚠  Running server reports '${RUNNING_VERSION}' but expected '${VERSION}'"
+            echo "     Try: sudo systemctl restart worklog.service"
+        fi
+    else
+        echo "  (could not reach http://localhost:5000/api/config to verify version)"
+    fi
     echo "============================================"
 else
     echo "🚀 Quick start:"
