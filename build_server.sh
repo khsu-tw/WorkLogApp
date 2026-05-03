@@ -109,10 +109,14 @@ echo "  PORT=8080 ./WorkLogServer"
 echo ""
 if [ "$IS_PI" = true ]; then
     echo "🤖 Install as systemd service (auto-start on boot):"
-    echo "  sudo bash setup_worklog_autostart.sh"
+    echo "  sudo bash setup_worklog_server_autostart.sh"
 else
     echo "🤖 Run as systemd service:"
-    echo "  sudo cp -r dist/WorkLogServer /opt/worklog/"
-    echo "  sudo bash setup_worklog_autostart.sh"
+    echo "  sudo mkdir -p /home/\$USER/worklog-server"
+    echo "  sudo cp -r dist/WorkLogServer/* /home/\$USER/worklog-server/"
+    echo "  sudo bash setup_worklog_server_autostart.sh"
 fi
+echo ""
+echo "🔍 Diagnose runtime issues:"
+echo "  sudo bash diagnose_worklog.sh"
 echo "============================================"
