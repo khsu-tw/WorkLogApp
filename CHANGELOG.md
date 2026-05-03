@@ -10,6 +10,33 @@ Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
 ---
 ## [v1.0.6] — 2026-05-03
 
+### 📋 Release Summary
+
+**Markdown Enhancements**
+- Fenced code blocks ` ```language ... ``` `
+- Blockquotes `> text`
+- GitHub-flavored Callouts — 📘 NOTE / 💡 TIP / ❗ IMPORTANT / ⚠️ WARNING / 🚨 CAUTION
+- Ordered-list marker type implies hierarchy: `1.` / `(1)` / `a.` / `A.`
+- `<ol start="N">` continued numbering after blank lines
+- Milestone & To-Do gain the full Worklogs Markdown set
+- New **ℹ️ Markdown** reference button on Worklogs
+
+**Sorting**
+- Worklogs Entry sorted newest-first (descending)
+- Existing records auto-resort on load
+
+**Dropdowns**
+- **BU**: added `DCS+NCS`
+- **Category**: renamed `Design-in` → `Design In`, `Design-win` → `Design Win`
+- Category re-sorted alphabetically with `Others` pinned last
+- Automatic DB migration of legacy values on startup
+
+**Misc**
+- 📋 Emoji SVG favicon
+- `/favicon.ico` 204 fallback route
+
+---
+
 ### 🆕 Added
 - **Worklogs Markdown extensions**:
   - **Fenced code blocks** — ` ```language ... ``` ` renders as monospaced block with dark background
@@ -297,8 +324,5 @@ Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
 
 ## [Future / Planned]
 
-- [ ] v1.0 — Full iOS/Android native app via Capacitor or React Native
 - [ ] v1.0 — Multi-user authentication (Supabase Row Level Security per user)
-- [ ] v1.0 — Attachment support (non-image files)
-- [ ] v1.0 — Rich-text editor (WYSIWYG instead of Markdown)
 - [ ] v1.1 — Email / calendar integration
