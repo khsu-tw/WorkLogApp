@@ -43,59 +43,61 @@ Quick setup:
 
 ---
 
-## 🖥️ Headless Server Deployment (Linux / Raspberry Pi)
+## 🖥️ Headless Server 部署 (Linux / Raspberry Pi)
 
-For a persistent WorkLogServer running as a systemd service (e.g. on a Raspberry Pi), three scripts work together:
+將 WorkLogServer 以 systemd 服務形式常駐（例如 Raspberry Pi），由以下三個腳本協作：
 
-| Script | Purpose | When to run |
+### 三個腳本的關係
+
+| 腳本 | 功能 | 使用時機 |
 |---|---|---|
-| **`build_server.sh`** | Compiles `WorkLogServer` executable and packages it as a `.tar.gz` | Every time after pulling new code |
-| **`setup_worklog_server_autostart.sh`** | **First-time install** — creates `worklog.service`, enables auto-start on boot, checks port availability | Once per machine |
-| **`update_worklog_server.sh`** | **Subsequent updates** — backs up current version → stops service → replaces binary → preserves `.env` / `*.db` → restarts → auto-rollback on failure | Every version upgrade |
+| **`build_server.sh`** | 編譯產生 `WorkLogServer` 執行檔和 tarball | 每次更新程式碼後 |
+| **`setup_worklog_server_autostart.sh`** | **首次安裝** — 建立 systemd service、設定開機啟動、檢查 port | 只跑一次 |
+| **`update_worklog_server.sh`** | **後續更新** — 備份舊版、停服務、替換執行檔、保護 `.env` / `*.db`、重啟、失敗時回滾 | 每次升級版本 |
 
-### Unified one-command flow (recommended)
+### 一鍵完整部署（推薦）
 
-`build_server.sh` supports a `--deploy` flag that auto-detects install state and invokes the correct script:
-
-```bash
-git pull                                       # fetch latest code
-sudo bash build_server.sh --deploy             # build + install (or update)
-```
-
-The `--deploy` flag detects:
-- **First install** → copies binary to `/home/khsu/worklog-server/`, then runs `setup_worklog_server_autostart.sh`
-- **Already installed** → runs `update_worklog_server.sh` (with auto-confirm; full backup + rollback)
-
-Three safety checks are performed automatically:
-1. **Before build** — warns if local `HEAD` differs from `origin/main` (prevents stale builds)
-2. **After build** — verifies bundled `VERSION` matches source `VERSION` (catches PyInstaller cache issues)
-3. **After deploy** — curls `http://localhost:5000/api/config` to confirm the running server reports the expected version
-
-### Standalone usage (scripts still work individually)
+`build_server.sh` 支援 `--deploy` 旗標，會自動偵測安裝狀態並呼叫對應腳本：
 
 ```bash
-bash build_server.sh                           # build only, no deploy
-sudo bash setup_worklog_server_autostart.sh    # first install only
-sudo bash update_worklog_server.sh             # update only
-sudo bash diagnose_worklog.sh                  # full health check / troubleshooting
+git pull                                       # 更新程式碼
+sudo bash build_server.sh --deploy             # 編譯 + 安裝（或升級）
 ```
 
-### Deployment decision table
+`--deploy` 的判斷邏輯：
+- **首次安裝** → 複製執行檔到 `/home/khsu/worklog-server/`，呼叫 `setup_worklog_server_autostart.sh`
+- **已安裝過** → 呼叫 `update_worklog_server.sh`（自動確認；含備份與回滾）
 
-| State on machine | `build_server.sh --deploy` does… |
+自動執行三層安全檢查：
+1. **編譯前** — 若 local `HEAD` 與 `origin/main` 不一致會警告（避免 build 到舊程式碼）
+2. **編譯後** — 驗證 bundle 內的 `VERSION` 等於原始碼 `VERSION`（抓出 PyInstaller cache 問題）
+3. **部署後** — 用 `curl http://localhost:5000/api/config` 驗證實際運行的 server 版本符合預期
+
+### 獨立使用（各腳本仍可單獨執行）
+
+```bash
+bash build_server.sh                           # 只編譯
+sudo bash setup_worklog_server_autostart.sh    # 只安裝（首次）
+sudo bash update_worklog_server.sh             # 只升級
+sudo bash diagnose_worklog.sh                  # 健康檢查 / 疑難排解
+```
+
+### 部署決策表
+
+| 機器狀態 | `build_server.sh --deploy` 的行為 |
 |---|---|
-| Fresh machine (no service, no target dir) | build → setup (first install) |
-| `worklog.service` + `/home/khsu/worklog-server/WorkLogServer` both exist | build → update (with backup & rollback) |
-| Service exists but binary missing | build → setup (treated as fresh) |
+| 全新機器（無 service、無 target 資料夾） | build → setup（首次安裝） |
+| `worklog.service` 和 `/home/khsu/worklog-server/WorkLogServer` 都存在 | build → update（含備份與回滾） |
+| service 存在但 binary 遺失 | build → setup（視為全新） |
 
-### Troubleshooting
+### 疑難排解
 
-If the browser still shows an old version after deploy:
+部署後瀏覽器仍顯示舊版：
 
-1. **Force browser reload**: Ctrl+F5 (PWA/Service Worker may cache old HTML)
-2. **Verify running version**: `curl http://<pi-ip>:5000/api/config | python3 -m json.tool | grep version`
-3. **Check git state**: local modifications may block `git pull`; run `git status` to see
-4. **Full diagnostic**: `sudo bash diagnose_worklog.sh` checks service, port, firewall, logs
+1. **強制重新載入**：Ctrl+F5（PWA / Service Worker 可能仍快取舊 HTML）
+2. **確認運行中的版本**：`curl http://<pi-ip>:5000/api/config | python3 -m json.tool | grep version`
+3. **檢查 git 狀態**：本地修改可能阻擋 `git pull`，先執行 `git status`
+4. **完整診斷**：`sudo bash diagnose_worklog.sh`（檢查服務、port、防火牆、日誌）
 
 ---
 
@@ -160,3 +162,8 @@ See [docs/](docs/) directory for:
 
 **Note:** docs/ and backup/ directories are excluded from Git repository.
 
+部署決策表
+狀態	build_server.sh --deploy 的行為
+全新機器	build → setup (首次安裝)
+已安裝過	build → update (含備份與回滾)
+service 存在但 binary 遺失	build → setup (視為全新)
