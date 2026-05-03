@@ -2,9 +2,28 @@
 # =============================================================================
 # Work Log Journal - Universal Server Build Script
 # Automatically detects platform (x86_64, ARM64, ARMv7) and builds accordingly
+#
+# Usage:
+#   bash build_server.sh             # build only
+#   sudo bash build_server.sh --deploy
+#                                   # build, then auto-detect install state:
+#                                   #   - first install  → invoke setup_worklog_server_autostart.sh
+#                                   #   - already installed → invoke update_worklog_server.sh
 # =============================================================================
 
 set -e
+
+# ── Parse arguments ──────────────────────────────────────────────────────────
+DEPLOY_MODE=false
+for arg in "$@"; do
+    case "$arg" in
+        --deploy) DEPLOY_MODE=true ;;
+        -h|--help)
+            head -n 13 "$0" | tail -n 11
+            exit 0
+            ;;
+    esac
+done
 
 VERSION=$(cat VERSION)
 ARCH=$(uname -m)          # x86_64, aarch64, armv7l, etc.
@@ -101,22 +120,48 @@ echo "  Executable:  dist/WorkLogServer/WorkLogServer"
 echo "  Package:     ${ARCHIVE_NAME}"
 echo "============================================"
 echo ""
-echo "🚀 Quick start:"
-echo "  cd dist/WorkLogServer && ./WorkLogServer"
-echo ""
-echo "🔧 Custom port:"
-echo "  PORT=8080 ./WorkLogServer"
-echo ""
-if [ "$IS_PI" = true ]; then
-    echo "🤖 Install as systemd service (auto-start on boot):"
-    echo "  sudo bash setup_worklog_server_autostart.sh"
+
+# ── 7. Optional deploy ───────────────────────────────────────────────────────
+if [ "$DEPLOY_MODE" = true ]; then
+    # --deploy requires root to manage systemd
+    if [ "$EUID" -ne 0 ]; then
+        echo "⚠  --deploy requires root. Re-run as: sudo bash $0 --deploy"
+        exit 1
+    fi
+
+    SERVICE_NAME="worklog.service"
+    TARGET_DIR="/home/khsu/worklog-server"
+
+    # Detect install state
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE_NAME}" && [ -f "${TARGET_DIR}/WorkLogServer" ]; then
+        echo "[7/7] Detected existing install → running update_worklog_server.sh"
+        echo ""
+        # update script expects interactive confirm; pipe "y" to auto-accept
+        yes y | bash "$(dirname "$0")/update_worklog_server.sh"
+    else
+        echo "[7/7] No existing install detected → running first-time setup"
+        echo ""
+        mkdir -p "${TARGET_DIR}"
+        cp -r dist/WorkLogServer/* "${TARGET_DIR}/"
+        chmod +x "${TARGET_DIR}/WorkLogServer"
+        chown -R khsu:khsu "${TARGET_DIR}" 2>/dev/null || true
+        bash "$(dirname "$0")/setup_worklog_server_autostart.sh"
+    fi
+    echo ""
+    echo "============================================"
+    echo " ✅ Deploy completed!"
+    echo "============================================"
 else
-    echo "🤖 Run as systemd service:"
-    echo "  sudo mkdir -p /home/\$USER/worklog-server"
-    echo "  sudo cp -r dist/WorkLogServer/* /home/\$USER/worklog-server/"
-    echo "  sudo bash setup_worklog_server_autostart.sh"
+    echo "🚀 Quick start:"
+    echo "  cd dist/WorkLogServer && ./WorkLogServer"
+    echo ""
+    echo "🔧 Custom port:"
+    echo "  PORT=8080 ./WorkLogServer"
+    echo ""
+    echo "🤖 Install or update via systemd (auto-detects install state):"
+    echo "  sudo bash $0 --deploy"
+    echo ""
+    echo "🔍 Diagnose runtime issues:"
+    echo "  sudo bash diagnose_worklog.sh"
+    echo "============================================"
 fi
-echo ""
-echo "🔍 Diagnose runtime issues:"
-echo "  sudo bash diagnose_worklog.sh"
-echo "============================================"
