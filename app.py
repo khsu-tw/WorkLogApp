@@ -121,9 +121,9 @@ SQLITE_PATH = _resolve_db_path()
 
 STATUS_OPTIONS   = ["Not Started","Early Engagement","WIP","Production",
                     "Cancelled","No More Activity","Task Done","Closed"]
-CATEGORY_OPTIONS = ["General","Visit","Training","Tech Support","Design Review",
-                    "Debug","Documentation","Design-in","Evaluation","Follow-up",
-                    "Design-win","Design Lost","Others"]
+CATEGORY_OPTIONS = ["Debug","Design In","Design Lost","Design Review","Design Win",
+                    "Documentation","Evaluation","Follow-up","General","Tech Support",
+                    "Training","Visit","Others"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATABASE — OFFLINE-FIRST HYBRID
@@ -201,6 +201,9 @@ class LocalDB:
             conflict_cols = {r[1] for r in cur2.fetchall()}
             if "conflict_type" not in conflict_cols:
                 c.execute("ALTER TABLE sync_conflicts ADD COLUMN conflict_type TEXT DEFAULT 'normal'")
+            # v1.0.6: rename legacy category values to new display form
+            c.execute("UPDATE worklog SET category='Design In'  WHERE category='Design-in'")
+            c.execute("UPDATE worklog SET category='Design Win' WHERE category='Design-win'")
             c.commit()
         finally:
             c.close()
@@ -1015,13 +1018,18 @@ def merge_worklogs(a, b):
     for dt, c in all_e:
         if c.strip() not in seen:
             seen.add(c.strip()); unique.append((dt, c))
-    unique.sort(key=lambda x: x[0])
+    # Sort newest-first (descending) per v1.0.6
+    unique.sort(key=lambda x: x[0], reverse=True)
     return "\n\n".join(f"── {dt.strftime('%Y-%m-%d')} ──\n{c}" for dt, c in unique)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
+@app.route("/favicon.ico")
+def favicon():
+    return ("", 204)
+
 @app.route("/api/records", methods=["GET"])
 def api_list():
     filters = {k: request.args.get(k,"") for k in
@@ -2109,6 +2117,7 @@ HTML = r"""<!DOCTYPE html>
 <meta name="apple-mobile-web-app-title" content="Work Log">
 <meta name="theme-color" content="#0f172a">
 <title>Work Log Journal</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📋</text></svg>">
 <link rel="manifest" href="/manifest.json">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
@@ -2261,14 +2270,62 @@ HTML = r"""<!DOCTYPE html>
   #wl-preview ul li, #ps-preview ul li, #todo-preview ul li { list-style-type: disc; }
   #wl-preview ul ul li, #ps-preview ul ul li, #todo-preview ul ul li { list-style-type: circle; }
   #wl-preview ul ul ul li, #ps-preview ul ul ul li, #todo-preview ul ul ul li { list-style-type: square; }
-  #wl-preview ol li, #ps-preview ol li, #todo-preview ol li { list-style-type: decimal; }
-  #wl-preview ol ol li, #ps-preview ol ol li, #todo-preview ol ol li { list-style-type: lower-alpha; }
-  #wl-preview ol ol ol li, #ps-preview ol ol ol li, #todo-preview ol ol ol li { list-style-type: lower-roman; }
+  /* Marker-style-based ordered list classes (v1.0.6 — 方案 D) */
+  #wl-preview ol.ol-decimal, #ps-preview ol.ol-decimal, #todo-preview ol.ol-decimal { list-style-type: decimal; }
+  #wl-preview ol.ol-alpha-lower, #ps-preview ol.ol-alpha-lower, #todo-preview ol.ol-alpha-lower { list-style-type: lower-alpha; }
+  #wl-preview ol.ol-alpha-upper, #ps-preview ol.ol-alpha-upper, #todo-preview ol.ol-alpha-upper { list-style-type: upper-alpha; }
+  #wl-preview ol.ol-paren, #ps-preview ol.ol-paren, #todo-preview ol.ol-paren {
+    list-style: none; padding-left: 2.2em;
+  }
+  #wl-preview ol.ol-paren > li, #ps-preview ol.ol-paren > li, #todo-preview ol.ol-paren > li {
+    counter-increment: list-item; position: relative;
+  }
+  #wl-preview ol.ol-paren > li::before, #ps-preview ol.ol-paren > li::before, #todo-preview ol.ol-paren > li::before {
+    content: "(" counter(list-item) ") "; position: absolute; left: -2.2em; width: 2em; text-align: right; padding-right: .2em;
+  }
+  /* Fallback for any ol without explicit class */
+  #wl-preview ol:not([class]), #ps-preview ol:not([class]), #todo-preview ol:not([class]) { list-style-type: decimal; }
   #wl-preview li, #ps-preview li, #todo-preview li { margin:.1em 0; }
   #wl-preview hr, #ps-preview hr, #todo-preview hr { border:none; border-top:1px solid var(--border); margin:.8em 0; }
   #wl-preview img { max-width:100%; border-radius:6px; margin:.5em 0; }
+  /* v1.0.6: Fenced code blocks */
+  #wl-preview pre, #ps-preview pre, #todo-preview pre {
+    background: var(--bg3); padding: .7em .9em; border-radius: 6px;
+    overflow-x: auto; margin: .5em 0; border: 1px solid var(--border);
+  }
+  #wl-preview pre code, #ps-preview pre code, #todo-preview pre code {
+    background: transparent; color: var(--fg); padding: 0; border-radius: 0;
+    font-family: var(--mono); font-size: .85em; line-height: 1.5; white-space: pre;
+  }
+  /* v1.0.6: Blockquote */
+  #wl-preview blockquote, #ps-preview blockquote, #todo-preview blockquote {
+    border-left: 3px solid var(--border); padding: .2em .8em; margin: .4em 0;
+    color: var(--fg2); background: rgba(255,255,255,.02);
+  }
+  /* v1.0.6: GFM-style Callouts */
+  #wl-preview .callout, #ps-preview .callout, #todo-preview .callout {
+    border-left: 4px solid; padding: .5em .8em; margin: .5em 0;
+    border-radius: 4px; background: var(--bg3);
+  }
+  #wl-preview .callout-title, #ps-preview .callout-title, #todo-preview .callout-title {
+    font-weight: 600; margin-bottom: .3em; font-size: .9em; display: flex; align-items: center; gap: .3em;
+  }
+  #wl-preview .callout-body, #ps-preview .callout-body, #todo-preview .callout-body {
+    font-size: .95em; line-height: 1.5;
+  }
+  .callout-note    { border-color: #3b82f6; } .callout-note    .callout-title { color: #60a5fa; }
+  .callout-tip     { border-color: #10b981; } .callout-tip     .callout-title { color: #34d399; }
+  .callout-important{border-color: #8b5cf6; } .callout-important .callout-title { color: #a78bfa; }
+  .callout-warning { border-color: #f59e0b; } .callout-warning .callout-title { color: #fbbf24; }
+  .callout-caution { border-color: #ef4444; } .callout-caution .callout-title { color: #f87171; }
   .md-hint { font-size:10.5px; color:var(--fg2); background:var(--bg3);
              padding:5px 10px; border-radius:6px; margin-top:5px; line-height:1.8; }
+  /* v1.0.6: Markdown tips reference tables */
+  .md-tips-tbl { width:100%; border-collapse:collapse; margin:0; }
+  .md-tips-tbl td { padding:3px 8px 3px 0; vertical-align:top; border:none; }
+  .md-tips-tbl td:first-child { white-space:nowrap; width:35%; }
+  .md-tips-tbl code { background:var(--bg3); color:#f472b6; padding:1px 5px;
+                      border-radius:4px; font-family:var(--mono); font-size:.9em; }
   .paste-zone { border:2px dashed var(--border); border-radius:8px; padding:10px;
                 text-align:center; font-size:12px; color:var(--fg2); cursor:pointer;
                 margin-top:6px; transition:.15s; }
@@ -2514,6 +2571,7 @@ HTML = r"""<!DOCTYPE html>
             <option value="">--</option>
             <option value="DCS">DCS</option>
             <option value="NCS">NCS</option>
+            <option value="DCS+NCS">DCS+NCS</option>
           </select>
         </div>
         <div class="form-row">
@@ -2540,6 +2598,7 @@ HTML = r"""<!DOCTYPE html>
               <button class="btn btn-accent btn-sm" onclick="setWlTab('edit')"><i class="icon">✏️</i> Edit</button>
               <button class="btn btn-ghost btn-sm" onclick="setWlTab('preview')">👁 Preview</button>
               <button class="btn btn-ghost btn-sm" onclick="insertStamp()"><i class="icon">➕</i> Add Entry</button>
+              <button class="btn btn-ghost btn-sm" onclick="showMdTips()" title="Markdown Syntax Reference">ℹ️ Markdown</button>
             </div>
           </div>
           <div id="wl-edit">
@@ -2565,16 +2624,6 @@ HTML = r"""<!DOCTYPE html>
             <div id="img-preview-area"></div>
           </div>
           <div id="wl-preview" style="display:none"></div>
-          <div class="md-hint">
-            <strong>Markdown:</strong>
-            <code># H1</code> <code>## H2</code> <code>### H3</code> &nbsp;|&nbsp;
-            <code>**bold**</code> <code>*italic*</code> <code>__underline__</code> <code>~~strikethrough~~</code> <code>`code`</code> &nbsp;|&nbsp;
-            <code>- bullet</code> <code>1. list</code>
-            <code>&nbsp;&nbsp;- sub</code> <code>&nbsp;&nbsp;&nbsp;&nbsp;- sub-sub</code>
-            (indent 2 spaces = next level) &nbsp;|&nbsp;
-            <code>---</code> &nbsp;|&nbsp;
-            Ctrl+V / drag &amp; drop image
-          </div>
         </div>
         <!-- Milestone -->
         <div class="form-row form-full">
@@ -2589,12 +2638,6 @@ HTML = r"""<!DOCTYPE html>
             <textarea id="f-project_schedule" rows="6" placeholder="Project milestones and timeline...&#10;Markdown supported."></textarea>
           </div>
           <div id="ps-preview"></div>
-          <div class="md-hint">
-            <strong>Markdown:</strong>
-            <code>**bold**</code> <code>*italic*</code> <code>__underline__</code> <code>~~strikethrough~~</code> <code>`code`</code> &nbsp;|&nbsp;
-            <code>- bullet</code> <code>1. list</code>
-            <code>&nbsp;&nbsp;- sub</code> (indent 2 spaces = next level)
-          </div>
         </div>
         <!-- To-Do -->
         <div class="form-row form-full">
@@ -2764,6 +2807,93 @@ HTML = r"""<!DOCTYPE html>
     <div style="display:flex;gap:8px;justify-content:flex-end">
       <button class="btn btn-ghost btn-sm" onclick="closeStamp()">Cancel</button>
       <button class="btn btn-accent btn-sm" onclick="confirmStamp()">Insert</button>
+    </div>
+  </div>
+</div>
+
+<!-- v1.0.6: Markdown Tips Modal -->
+<div id="md-tips-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);
+     z-index:200;align-items:center;justify-content:center" onclick="if(event.target===this)closeMdTips()">
+  <div style="background:var(--bg2);border-radius:14px;width:92%;max-width:720px;max-height:85vh;
+              border:1px solid var(--border);box-shadow:0 16px 48px rgba(0,0,0,.5);
+              display:flex;flex-direction:column">
+    <div style="display:flex;align-items:center;justify-content:space-between;
+                padding:14px 18px;border-bottom:1px solid var(--border)">
+      <h3 style="margin:0;font-size:15px;font-weight:700">ℹ️ Markdown Syntax Reference</h3>
+      <button class="btn btn-ghost btn-sm" onclick="closeMdTips()" style="padding:4px 10px">✕</button>
+    </div>
+    <div class="md-tips-body" style="overflow-y:auto;padding:16px 18px;flex:1;font-size:13px;line-height:1.6">
+
+      <h4 style="margin:0 0 8px;color:var(--accent);font-size:13px">📝 Headings</h4>
+      <table class="md-tips-tbl"><tbody>
+        <tr><td><code># Heading 1</code></td><td>Large heading</td></tr>
+        <tr><td><code>## Heading 2</code></td><td>Medium heading</td></tr>
+        <tr><td><code>### Heading 3</code></td><td>Small heading</td></tr>
+      </tbody></table>
+
+      <h4 style="margin:14px 0 8px;color:var(--accent);font-size:13px">✏️ Text Formatting</h4>
+      <table class="md-tips-tbl"><tbody>
+        <tr><td><code>**bold**</code></td><td><b>bold</b></td></tr>
+        <tr><td><code>*italic*</code></td><td><i>italic</i></td></tr>
+        <tr><td><code>__underline__</code></td><td><u>underline</u></td></tr>
+        <tr><td><code>~~strikethrough~~</code></td><td><s>strikethrough</s></td></tr>
+        <tr><td><code>`inline code`</code></td><td><code>inline code</code></td></tr>
+      </tbody></table>
+
+      <h4 style="margin:14px 0 8px;color:var(--accent);font-size:13px">📋 Lists — Marker Type Implies Hierarchy Level (v1.0.6)</h4>
+      <table class="md-tips-tbl"><tbody>
+        <tr><td><code>- item</code></td><td>Bullet list (use <code>*</code> or <code>+</code> too)</td></tr>
+        <tr><td><code>1. item</code></td><td>Decimal — <b>Level 0</b> — renders as <code>1. 2. 3.</code></td></tr>
+        <tr><td><code>(1) item</code></td><td>Paren — <b>Level 1</b> — renders as <code>(1) (2) (3)</code></td></tr>
+        <tr><td><code>a. item</code></td><td>Lowercase alpha — <b>Level 2</b> — renders as <code>a. b. c.</code></td></tr>
+        <tr><td><code>A. item</code></td><td>Uppercase alpha — <b>Level 3</b> — renders as <code>A. B. C.</code></td></tr>
+        <tr><td colspan="2" style="color:var(--fg2);font-size:12px;padding-top:4px">
+          Continued numbering: write <code>3.</code> after a blank line to resume at 3 (via <code>&lt;ol start&gt;</code>).
+        </td></tr>
+      </tbody></table>
+
+      <h4 style="margin:14px 0 8px;color:var(--accent);font-size:13px">💻 Fenced Code Block (v1.0.6)</h4>
+<pre style="background:var(--bg3);padding:8px 10px;border-radius:6px;border:1px solid var(--border);
+           margin:0 0 6px;font-family:var(--mono);font-size:12px"><code>```python
+def hello():
+    print("world")
+```</code></pre>
+      <div style="color:var(--fg2);font-size:12px">Language label is optional. Any language name works.</div>
+
+      <h4 style="margin:14px 0 8px;color:var(--accent);font-size:13px">💬 Blockquote</h4>
+<pre style="background:var(--bg3);padding:8px 10px;border-radius:6px;border:1px solid var(--border);
+           margin:0 0 6px;font-family:var(--mono);font-size:12px"><code>&gt; Quoted text
+&gt; Can be multi-line</code></pre>
+
+      <h4 style="margin:14px 0 8px;color:var(--accent);font-size:13px">📣 Callouts (GitHub Flavored, v1.0.6)</h4>
+<pre style="background:var(--bg3);padding:8px 10px;border-radius:6px;border:1px solid var(--border);
+           margin:0 0 6px;font-family:var(--mono);font-size:12px"><code>&gt; [!NOTE]
+&gt; Note message
+
+&gt; [!TIP]
+&gt; Tip message
+
+&gt; [!IMPORTANT]
+&gt; Important info
+
+&gt; [!WARNING]
+&gt; Warning
+
+&gt; [!CAUTION]
+&gt; Caution / danger</code></pre>
+      <div style="color:var(--fg2);font-size:12px">Each callout has a coloured border: 📘 NOTE 💡 TIP ❗ IMPORTANT ⚠️ WARNING 🚨 CAUTION.</div>
+
+      <h4 style="margin:14px 0 8px;color:var(--accent);font-size:13px">🔧 Other</h4>
+      <table class="md-tips-tbl"><tbody>
+        <tr><td><code>---</code></td><td>Horizontal rule</td></tr>
+        <tr><td><code>── 2026-05-03 ──</code></td><td>Date stamp — use <b>Add Entry</b> button to insert</td></tr>
+        <tr><td><code>Ctrl+V</code> / drag</td><td>Paste or drop images directly</td></tr>
+        <tr><td>📎 File zone</td><td>Click or drag any file (max 5 MB)</td></tr>
+      </tbody></table>
+
+      <div style="color:var(--fg2);font-size:12px;margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
+        Worklog entries auto-sort by date (newest first) when you add a new stamp.
+      </div>
     </div>
   </div>
 </div>
@@ -3267,6 +3397,8 @@ function fillForm(rec) {
     _addFileChip(uid, name, size);
   }
   document.getElementById('f-worklogs').value = wlDisplay;
+  // v1.0.6: re-sort existing records' Worklogs newest-first on load
+  sortWorklogs();
 
   // Capture initial state for change detection
   initialFormState = captureFormState();
@@ -3467,6 +3599,13 @@ function insertStamp() {
 function closeStamp() {
   document.getElementById('stamp-overlay').style.display = 'none';
 }
+// v1.0.6: Markdown tips modal
+function showMdTips() {
+  document.getElementById('md-tips-overlay').style.display = 'flex';
+}
+function closeMdTips() {
+  document.getElementById('md-tips-overlay').style.display = 'none';
+}
 function confirmStamp() {
   const dateVal = document.getElementById('stamp-date').value;
   if (!dateVal) { closeStamp(); return; }
@@ -3501,7 +3640,8 @@ function sortWorklogs() {
     entries.push({ stamp: normStamp, body, dateKey });
   }
   if (entries.length < 2) return;
-  entries.sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  // Sort newest-first (descending) per v1.0.6
+  entries.sort((a, b) => b.dateKey.localeCompare(a.dateKey));
   ta.value = pre + entries.map(e => e.stamp + e.body).join('');
 }
 
@@ -3541,12 +3681,53 @@ function parseMarkdown(md) {
   // ── Build token list ───────────────────────────────────────────────────────
   // Each token: {type, indent, content, ordered}
   const tokens = [];
-  for (const raw of lines) {
+  const calloutTypes = {NOTE: '📘', TIP: '💡', IMPORTANT: '❗', WARNING: '⚠️', CAUTION: '🚨'};
+  let i = 0;
+  while (i < lines.length) {
+    const raw = lines[i];
+
+    // v1.0.6: Fenced code block (```lang ... ```)
+    const codeStart = raw.match(/^```(\w*)\s*$/);
+    if (codeStart) {
+      const lang = codeStart[1] || '';
+      const codeLines = [];
+      i++;
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      i++; // skip closing ```
+      tokens.push({type:'code', lang, content: codeLines.join('\n')});
+      continue;
+    }
+
+    // v1.0.6: Blockquote / Callout (> ...)
+    const quoteFirst = raw.match(/^>\s?(.*)/);
+    if (quoteFirst) {
+      const quoteLines = [quoteFirst[1]];
+      i++;
+      while (i < lines.length) {
+        const m = lines[i].match(/^>\s?(.*)/);
+        if (!m) break;
+        quoteLines.push(m[1]);
+        i++;
+      }
+      const firstLine = (quoteLines[0] || '').trim();
+      const calloutMatch = firstLine.match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*$/i);
+      if (calloutMatch) {
+        const type = calloutMatch[1].toUpperCase();
+        tokens.push({type:'callout', calloutType: type, content: quoteLines.slice(1).join('\n')});
+      } else {
+        tokens.push({type:'blockquote', content: quoteLines.join('\n')});
+      }
+      continue;
+    }
+
     const line = raw.replace(/\[IMG:[a-f0-9]{12}\]/g, '');
 
     if (/^── \d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})? ──$/.test(line.trim())) {
       const norm = line.trim().replace(/── (\d{4}-\d{2}-\d{2})(?:(?: \d{2}:\d{2}))? ──/, '── $1 ──');
-      tokens.push({type:'stamp', content: norm}); continue;
+      tokens.push({type:'stamp', content: norm}); i++; continue;
     }
     // Measure indent for every line (used by lists AND images)
     const indentMatch = line.match(/^([ \t]*)/);
@@ -3555,23 +3736,31 @@ function parseMarkdown(md) {
     const rest        = line.slice(rawIndent.length);
 
     if (/^\x00IMG\d+\x00$/.test(rest.trim())) {
-      tokens.push({type:'img', indent, content: rest.trim()}); continue;
+      tokens.push({type:'img', indent, content: rest.trim()}); i++; continue;
     }
     if (/^\x00FILE\d+\x00$/.test(rest.trim())) {
-      tokens.push({type:'file', indent, content: rest.trim()}); continue;
+      tokens.push({type:'file', indent, content: rest.trim()}); i++; continue;
     }
     if (/^-{3,}$/.test(rest.trim())) {
-      tokens.push({type:'hr'}); continue;
+      tokens.push({type:'hr'}); i++; continue;
     }
     const hm = rest.match(/^(#{1,3})\s+(.*)/);
-    if (hm) { tokens.push({type:'h', level: hm[1].length, content: hm[2]}); continue; }
+    if (hm) { tokens.push({type:'h', level: hm[1].length, content: hm[2]}); i++; continue; }
 
     const bm = rest.match(/^[-*+]\s+(.*)/);
-    if (bm) { tokens.push({type:'li', indent, ordered:false, content: bm[1]}); continue; }
+    if (bm) { tokens.push({type:'li', indent, ordered:false, content: bm[1]}); i++; continue; }
+    // v1.0.6: recognise 4 ordered-list marker styles; display matches what user typed
     const nm = rest.match(/^(\d+)\.\s+(.*)/);
-    if (nm) { tokens.push({type:'li', indent, ordered:true,  content: nm[2]}); continue; }
+    if (nm) { tokens.push({type:'li', indent, ordered:true, style:'decimal', num: parseInt(nm[1], 10), content: nm[2]}); i++; continue; }
+    const pm = rest.match(/^\((\d+)\)\s+(.*)/);
+    if (pm) { tokens.push({type:'li', indent, ordered:true, style:'paren', num: parseInt(pm[1], 10), content: pm[2]}); i++; continue; }
+    const am = rest.match(/^([a-z])\.\s+(.*)/);
+    if (am) { tokens.push({type:'li', indent, ordered:true, style:'alpha-lower', num: am[1].charCodeAt(0) - 96, content: am[2]}); i++; continue; }
+    const aM = rest.match(/^([A-Z])\.\s+(.*)/);
+    if (aM) { tokens.push({type:'li', indent, ordered:true, style:'alpha-upper', num: aM[1].charCodeAt(0) - 64, content: aM[2]}); i++; continue; }
 
     tokens.push({type:'p', content: line});
+    i++;
   }
 
   // ── Render tokens → HTML ───────────────────────────────────────────────────
@@ -3596,38 +3785,64 @@ function parseMarkdown(md) {
     while (stack.length && peekTop().level > targetLevel) closeTop();
   }
 
+  // v1.0.6 方案 A + D: open <ol> with start="N" and style-based class
+  const olStyleClass = {
+    'decimal':     'ol-decimal',
+    'paren':       'ol-paren',
+    'alpha-lower': 'ol-alpha-lower',
+    'alpha-upper': 'ol-alpha-upper'
+  };
+  // Marker type implies hierarchy level: 1. -> 0, (1) -> 1, a. -> 2, A. -> 3
+  const styleToLevel = {
+    'decimal':     0,
+    'paren':       1,
+    'alpha-lower': 2,
+    'alpha-upper': 3
+  };
+  function openList(tag, level, num, style) {
+    let attrs = '';
+    if (tag === 'ol') {
+      const cls = olStyleClass[style] || 'ol-decimal';
+      attrs += ` class="${cls}"`;
+      if (num && num > 1) attrs += ` start="${num}"`;
+    }
+    html += `<${tag}${attrs}>`;
+    stack.push({tag, level, style, liOpen: false});
+  }
+
   for (const tok of tokens) {
     if (tok.type === 'li') {
       const tag   = tok.ordered ? 'ol' : 'ul';
-      const level = Math.floor(tok.indent / 2);
+      const style = tok.style || null;
+      // Ordered lists: marker style defines the level (can be overridden by deeper indent).
+      // Unordered lists: level comes from indent as before.
+      const indentLevel = Math.floor(tok.indent / 2);
+      const level = (tok.ordered && style in styleToLevel)
+        ? Math.max(styleToLevel[style], indentLevel)
+        : indentLevel;
       const top   = peekTop();
 
       if (!top) {
-        html += `<${tag}>`;
-        stack.push({tag, level, liOpen: false});
+        openList(tag, level, tok.num, style);
       } else if (level > top.level) {
         // Going deeper — open sub-list inside the current open <li>
-        html += `<${tag}>`;
-        stack.push({tag, level, liOpen: false});
+        openList(tag, level, tok.num, style);
       } else if (level < top.level) {
         closeTo(level);
         const cur = peekTop();
         if (!cur || cur.level !== level) {
-          html += `<${tag}>`;
-          stack.push({tag, level, liOpen: false});
-        } else if (cur.tag !== tag) {
+          openList(tag, level, tok.num, style);
+        } else if (cur.tag !== tag || cur.style !== style) {
           closeTop();
-          html += `<${tag}>`;
-          stack.push({tag, level, liOpen: false});
+          openList(tag, level, tok.num, style);
         } else {
           if (cur.liOpen) { html += '</li>'; cur.liOpen = false; }
         }
       } else {
-        // Same level
-        if (top.tag !== tag) {
+        // Same level — different marker style also starts a new list
+        if (top.tag !== tag || top.style !== style) {
           closeTop();
-          html += `<${tag}>`;
-          stack.push({tag, level, liOpen: false});
+          openList(tag, level, tok.num, style);
         } else {
           if (top.liOpen) { html += '</li>'; top.liOpen = false; }
         }
@@ -3649,6 +3864,30 @@ function parseMarkdown(md) {
       }
       else if (tok.type === 'hr')    html += '<hr>';
       else if (tok.type === 'h')     html += `<h${tok.level}>${inlineM(tok.content)}</h${tok.level}>`;
+      else if (tok.type === 'code') {
+        // Convert sentinels back to placeholder text inside code blocks
+        const raw = tok.content.replace(/\x00IMG\d+\x00/g, '[📷]').replace(/\x00FILE\d+\x00/g, '[📎]');
+        const langAttr = tok.lang ? ` class="language-${esc(tok.lang)}"` : '';
+        html += `<pre><code${langAttr}>${esc(raw)}</code></pre>`;
+      }
+      else if (tok.type === 'callout') {
+        const typeLower = tok.calloutType.toLowerCase();
+        const icon = calloutTypes[tok.calloutType] || '';
+        const body = tok.content.split('\n').map(l => {
+          const resolved = l.replace(/\x00IMG(\d+)\x00/g, (_, i) => IMG_TOK[+i] || '')
+                            .replace(/\x00FILE(\d+)\x00/g, (_, i) => FILE_TOK[+i] || '');
+          return inlineM(resolved);
+        }).join('<br>');
+        html += `<div class="callout callout-${typeLower}"><div class="callout-title">${icon} ${tok.calloutType}</div><div class="callout-body">${body}</div></div>`;
+      }
+      else if (tok.type === 'blockquote') {
+        const body = tok.content.split('\n').map(l => {
+          const resolved = l.replace(/\x00IMG(\d+)\x00/g, (_, i) => IMG_TOK[+i] || '')
+                            .replace(/\x00FILE(\d+)\x00/g, (_, i) => FILE_TOK[+i] || '');
+          return inlineM(resolved);
+        }).join('<br>');
+        html += `<blockquote>${body}</blockquote>`;
+      }
       else {
         let resolved = tok.content.replace(/\x00IMG(\d+)\x00/g, (_, i) => IMG_TOK[+i] || '');
         resolved = resolved.replace(/\x00FILE(\d+)\x00/g, (_, i) => FILE_TOK[+i] || '');

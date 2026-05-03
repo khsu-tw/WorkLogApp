@@ -8,6 +8,42 @@ Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
 - **PATCH** — backward-compatible bug fixes
 
 ---
+## [v1.0.6] — 2026-05-03
+
+### 🆕 Added
+- **Worklogs Markdown extensions**:
+  - **Fenced code blocks** — ` ```language ... ``` ` renders as monospaced block with dark background
+  - **Blockquotes** — `> text` renders as left-bordered quote
+  - **GFM-style Callouts** — `> [!NOTE|TIP|IMPORTANT|WARNING|CAUTION]` renders as colored banner with icon
+- **Ordered-list hierarchy by marker type** — marker syntax implies level automatically:
+  - `1. 2. 3.` → Level 0 (decimal)
+  - `(1) (2) (3)` → Level 1 (parenthesized)
+  - `a. b. c.` → Level 2 (lower-alpha)
+  - `A. B. C.` → Level 3 (upper-alpha)
+- **Continued numbering** — `<ol start="N">` emitted when user writes `3.` after a blank line, preventing numbering reset
+- **Markdown reference modal** — ℹ️ Markdown button in Worklogs tab bar opens a scrollable overlay with full syntax cheat sheet
+- **BU option**: `DCS+NCS` added to BU dropdown
+- **Emoji SVG favicon** — 📋 clipboard icon via inline `data:image/svg+xml` (no file dependency)
+
+### 🔧 Changed
+- **Worklogs entry sorting**: newest-first (descending) — both backend `merge_worklogs()` and frontend `sortWorklogs()`
+- **Existing records auto-resort**: opening an existing record calls `sortWorklogs()` on load so the display reflects the new order; next save persists it to DB
+- **Category options**: renamed `Design-in` → `Design In`, `Design-win` → `Design Win`; list re-sorted alphabetically with `Others` pinned last
+  - Final order: Debug, Design In, Design Lost, Design Review, Design Win, Documentation, Evaluation, Follow-up, General, Tech Support, Training, Visit, Others
+- **Automatic DB migration** on startup — legacy `Design-in` / `Design-win` values in `worklog.category` updated to new form
+- **Milestone & To-Do fields** now render the full Worklogs Markdown set (code blocks, callouts, blockquotes, 4-marker list hierarchy) — same `parseMarkdown()` already shared across previews
+- Removed inline `md-hint` cheat-sheet blocks under Worklogs and Milestone (replaced by the Markdown modal on Worklogs only)
+
+### 🐛 Fixed
+- **favicon 404** — added `/favicon.ico` route returning 204 No Content as fallback when the inline SVG link is ignored by a client
+
+### 🏗 Technical Details
+- `parseMarkdown()` tokenizer converted from `for` loop to `while` loop with index to handle multi-line blocks (code fences, quote groups)
+- New token types: `code` (with optional `lang`), `callout` (with `calloutType`), `blockquote`
+- Sentinel replacement (`\x00IMG\d+\x00`, `\x00FILE\d+\x00`) neutralized inside code blocks to `[📷]` / `[📎]` placeholders so image/file substitution doesn't mangle code samples
+- List rendering tracks `style` on the stack frame — a style change at the same indent level closes the current `<ol>` and opens a new one with the correct class
+- CSS classes `ol-decimal`, `ol-paren`, `ol-alpha-lower`, `ol-alpha-upper` map to `list-style-type` (or `::before` counter for paren), applied via `<ol class="…">`
+- Callout colors use left-border + accent-tinted title: blue/green/purple/amber/red for the 5 types
 
 ## [v1.0.5] — 2026-04-29
 
