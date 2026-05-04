@@ -1347,7 +1347,10 @@ def api_export_word():
     try:
         body     = request.json or {}
         ids      = body.get("ids", [])       # list of record IDs to export
+        mode     = body.get("mode", "")      # "all" | "week" | "range"
         week_str = body.get("week", "")      # optional: "YYYY-WNN" format
+        start_str = body.get("start_date", "")  # "YYYY-MM-DD"
+        end_str   = body.get("end_date", "")    # "YYYY-MM-DD"
         all_rows = get_db().fetch_all()
 
         # Filter to selected IDs only
@@ -1362,7 +1365,9 @@ def api_export_word():
 
         # Parse week parameter if provided
         target_year, target_week = None, None
-        if week_str and week_str != "all":
+        if not mode and week_str and week_str != "all":
+            mode = "week"
+        if mode == "week" and week_str and week_str != "all":
             try:
                 # Format: "YYYY-WNN"
                 parts = week_str.split("-W")
@@ -1371,8 +1376,21 @@ def api_export_word():
             except (ValueError, IndexError):
                 pass
 
+        # Parse date range if provided (v1.0.7)
+        start_date = end_date = None
+        if mode == "range" and start_str and end_str:
+            try:
+                start_date = datetime.datetime.strptime(start_str, "%Y-%m-%d").date()
+                end_date   = datetime.datetime.strptime(end_str,   "%Y-%m-%d").date()
+                if start_date > end_date:
+                    start_date, end_date = end_date, start_date
+            except ValueError:
+                return jsonify({"error": "Invalid date format (expected YYYY-MM-DD)"}), 400
+
         buf = io.BytesIO()
-        _build_word_doc(rows, buf, target_year=target_year, target_week=target_week)
+        _build_word_doc(rows, buf,
+                        target_year=target_year, target_week=target_week,
+                        start_date=start_date, end_date=end_date)
         buf.seek(0)
         if buf.getbuffer().nbytes < 100:
             return jsonify({"error": "Document generation produced empty output"}), 500
@@ -1991,15 +2009,19 @@ def _wl_content_to_word(cell, content, bg_hex, doc):
             add_inline(p, stripped)
 
 
-def _build_word_doc(all_rows, out_buf, target_year=None, target_week=None):
+def _build_word_doc(all_rows, out_buf, target_year=None, target_week=None,
+                    start_date=None, end_date=None):
     """Build Word report: Task Summary + selected week Worklogs with Markdown/image rendering."""
-    # If no target week specified, use all records
+    # Determine filter mode: week > date range > all
     if target_year and target_week:
         wmon, wfri = _week_date_range(target_year, target_week)
         week_str = (f"Week {target_week}  ·  "
                     f"{wmon.strftime('%Y-%m-%d')} – {wfri.strftime('%Y-%m-%d')}")
+    elif start_date and end_date:
+        week_str = f"{start_date.strftime('%Y-%m-%d')} – {end_date.strftime('%Y-%m-%d')}"
     else:
         target_year = target_week = None
+        start_date = end_date = None
         week_str = "All records"
 
     doc = DocxDocument()
@@ -2038,6 +2060,12 @@ def _build_word_doc(all_rows, out_buf, target_year=None, target_week=None):
             entries = [(dt, c) for dt, c in parse_worklog_entries(wl)
                        if dt.isocalendar()[:2] == (target_year, target_week)]
             # Only include records that have entries in the target week
+            if not entries:
+                continue
+        elif start_date and end_date:
+            # v1.0.7: Filter entries for specified date range (inclusive)
+            entries = [(dt, c) for dt, c in parse_worklog_entries(wl)
+                       if dt.year > 1970 and start_date <= dt.date() <= end_date]
             if not entries:
                 continue
         else:
@@ -2197,6 +2225,10 @@ HTML = r"""<!DOCTYPE html>
     width:100%; outline:none; transition:border .15s; }
   input:focus, select:focus, textarea:focus { border-color:var(--accent); }
   input[type="date"] { width:140px; }
+  /* v1.0.7: radio/checkbox should not inherit text-input box styling */
+  input[type="radio"], input[type="checkbox"] {
+    width:auto; padding:0; border:0; border-radius:0; background:transparent;
+    vertical-align:middle; }
   select { width:auto; min-width:120px; }
   textarea { resize:vertical; font-family:var(--mono); font-size:12px; }
 
@@ -2729,18 +2761,49 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<!-- Week Selection Modal for Word Export -->
+<!-- Week / Date Range Selection Modal for Word Export -->
 <div id="week-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:115;align-items:center;justify-content:center;padding:12px">
-  <div style="background:var(--bg2);border-radius:14px;padding:20px;max-width:400px;width:100%;border:1px solid var(--border)">
+  <div style="background:var(--bg2);border-radius:14px;padding:20px;max-width:420px;width:100%;border:1px solid var(--border)">
     <h2 style="margin-bottom:12px;font-size:15px"><i class="icon">📄</i> Export to Word</h2>
     <p style="font-size:12px;color:var(--fg2);margin-bottom:12px">
-      Select which week's worklogs to include in the report:
+      Select which worklogs to include in the report:
     </p>
-    <div style="margin-bottom:14px">
+
+    <!-- v1.0.7: Filter mode selection -->
+    <div style="margin-bottom:12px">
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer;font-size:13px">
+        <input type="radio" name="word-mode" value="all" id="word-mode-all" checked style="width:auto;margin:0">
+        <span>All Worklogs (no filter)</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer;font-size:13px">
+        <input type="radio" name="word-mode" value="week" id="word-mode-week" style="width:auto;margin:0">
+        <span>By Week</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+        <input type="radio" name="word-mode" value="range" id="word-mode-range" style="width:auto;margin:0">
+        <span>By Date Range</span>
+      </label>
+    </div>
+
+    <!-- Week selector -->
+    <div id="word-week-section" style="display:none;margin-bottom:14px">
       <select id="week-select" style="width:100%;padding:10px;font-size:13px">
-        <option value="all">All Worklogs</option>
+        <option value="all">Loading weeks...</option>
       </select>
     </div>
+
+    <!-- Date range inputs (v1.0.7) -->
+    <div id="word-range-section" style="display:none;margin-bottom:14px;padding:10px;background:var(--bg3);border-radius:8px">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+        <label style="font-size:12px;width:70px">Start date:</label>
+        <input type="date" id="word-start-date" style="flex:1;padding:6px;font-size:13px">
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <label style="font-size:12px;width:70px">End date:</label>
+        <input type="date" id="word-end-date" style="flex:1;padding:6px;font-size:13px">
+      </div>
+    </div>
+
     <div id="week-info" style="font-size:11px;color:var(--fg2);margin-bottom:14px;padding:8px;background:var(--bg3);border-radius:6px;display:none">
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end">
@@ -4232,6 +4295,29 @@ async function openWeekSelect() {
   info.style.display = 'none';
   document.getElementById('week-overlay').style.display = 'flex';
 
+  // v1.0.7: Wire up mode radio toggles
+  const modeAll   = document.getElementById('word-mode-all');
+  const modeWeek  = document.getElementById('word-mode-week');
+  const modeRange = document.getElementById('word-mode-range');
+  const weekSec   = document.getElementById('word-week-section');
+  const rangeSec  = document.getElementById('word-range-section');
+  const updateWordSections = () => {
+    weekSec.style.display  = modeWeek.checked  ? 'block' : 'none';
+    rangeSec.style.display = modeRange.checked ? 'block' : 'none';
+  };
+  modeAll.checked = true;
+  [modeAll, modeWeek, modeRange].forEach(r => {
+    r.onchange = updateWordSections;
+  });
+  updateWordSections();
+
+  // Default date range to last 7 days
+  const today = new Date();
+  const weekAgo = new Date(today.getTime() - 6 * 86400000);
+  const fmt = d => d.toISOString().slice(0, 10);
+  document.getElementById('word-start-date').value = fmt(weekAgo);
+  document.getElementById('word-end-date').value   = fmt(today);
+
   try {
     const res = await fetch('/api/export/weeks', {
       method: 'POST',
@@ -4240,17 +4326,18 @@ async function openWeekSelect() {
     });
     const weeks = await res.json();
 
-    sel.innerHTML = '<option value="all">📋 All Worklogs (no filter)</option>';
-    weeks.forEach(w => {
-      const opt = document.createElement('option');
-      opt.value = w.value;
-      opt.textContent = `${w.label}  (${w.range})`;
-      sel.appendChild(opt);
-    });
-
+    sel.innerHTML = '';
     if (weeks.length === 0) {
+      sel.innerHTML = '<option value="all">(No dated worklogs)</option>';
       info.textContent = 'No dated worklogs found in selected records.';
       info.style.display = 'block';
+    } else {
+      weeks.forEach(w => {
+        const opt = document.createElement('option');
+        opt.value = w.value;
+        opt.textContent = `${w.label}  (${w.range})`;
+        sel.appendChild(opt);
+      });
     }
   } catch (e) {
     sel.innerHTML = '<option value="all">All Worklogs</option>';
@@ -4265,11 +4352,22 @@ function closeWeekSelect() {
 }
 
 async function confirmWeekExport() {
-  const week = document.getElementById('week-select').value;
-  if (week === 'loading') return;
+  const mode = document.querySelector('input[name="word-mode"]:checked').value;
+  const payload = { ids: [...exportIds], mode };
 
-  // Save exportIds before closing (which clears exportIds)
-  const idsToExport = [...exportIds];
+  if (mode === 'week') {
+    const week = document.getElementById('week-select').value;
+    if (!week || week === 'loading') { toast('⚠ Please choose a week'); return; }
+    payload.week = week;
+  } else if (mode === 'range') {
+    const start = document.getElementById('word-start-date').value;
+    const end   = document.getElementById('word-end-date').value;
+    if (!start || !end) { toast('⚠ Please select start and end dates'); return; }
+    payload.start_date = start;
+    payload.end_date   = end;
+  }
+
+  const idsToExport = payload.ids;
   closeWeekSelect();
   toast(`Generating report for ${idsToExport.length} record(s)…`);
 
@@ -4277,7 +4375,7 @@ async function confirmWeekExport() {
     const res = await fetch('/api/export/word', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ ids: idsToExport, week })
+      body: JSON.stringify(payload)
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({error: res.statusText}));

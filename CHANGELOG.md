@@ -8,6 +8,10 @@ Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
 - **PATCH** — backward-compatible bug fixes
 
 ---
+## [v1.0.7] — 2026-05-04
+- Word輸出增加指定日期區間設定，輸出內容與原Word輸出內容一樣。
+
+
 ## [v1.0.6] — 2026-05-03
 
 ### 📋 Release Summary
