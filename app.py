@@ -1404,16 +1404,35 @@ def api_export_word():
         return jsonify({"error": str(e)}), 500
 
 
-def _export_excel_wlr(rows):
-    """Export WLR format (v0.9.5 comprehensive format)."""
+def _export_excel_wlr(rows, wlr_mode="all", target_year=None, target_week=None,
+                       start_date=None, end_date=None):
+    """Export WLR format with optional date-based record filtering."""
     wb = Workbook()
     ws = wb.active
     ws.title = "WorkLog Report"
 
     rows = [r for r in rows if (r.get("archive") or "No") != "Yes"]
 
+    # Filter records to those with worklog activity in the selected period
+    if wlr_mode == "week" and target_year and target_week:
+        filtered = []
+        for row in rows:
+            for dt, _ in parse_worklog_entries(row.get("worklogs") or ""):
+                if dt.isocalendar()[:2] == (target_year, target_week):
+                    filtered.append(row)
+                    break
+        rows = filtered
+    elif wlr_mode == "range" and start_date and end_date:
+        filtered = []
+        for row in rows:
+            for dt, _ in parse_worklog_entries(row.get("worklogs") or ""):
+                if start_date <= dt.date() <= end_date:
+                    filtered.append(row)
+                    break
+        rows = filtered
+
     if not rows:
-        return jsonify({"error": "No records to export (all selected records are archived)"}), 400
+        return jsonify({"error": "No records to export (none match the selected filter)"}), 400
 
     # Column mapping: DB field -> Excel header
     columns = [
@@ -1585,6 +1604,10 @@ def api_export_excel():
         ids = body.get("ids", [])
         export_format = body.get("format", "WLR")
         date_filter = body.get("date_filter", "all")
+        wlr_mode = body.get("wlr_mode", "all")
+        wlr_week_str  = body.get("wlr_week", "")
+        wlr_start_str = body.get("wlr_start_date", "")
+        wlr_end_str   = body.get("wlr_end_date", "")
 
         all_rows = get_db().fetch_all()
 
@@ -1600,7 +1623,26 @@ def api_export_excel():
         if export_format == "TODO":
             return _export_excel_todo(rows, date_filter)
         else:
-            return _export_excel_wlr(rows)
+            target_year = target_week = None
+            start_date = end_date = None
+            if wlr_mode == "week" and wlr_week_str:
+                try:
+                    parts = wlr_week_str.split("-W")
+                    target_year = int(parts[0])
+                    target_week = int(parts[1])
+                except (ValueError, IndexError):
+                    pass
+            elif wlr_mode == "range" and wlr_start_str and wlr_end_str:
+                try:
+                    start_date = datetime.datetime.strptime(wlr_start_str, "%Y-%m-%d").date()
+                    end_date   = datetime.datetime.strptime(wlr_end_str,   "%Y-%m-%d").date()
+                    if start_date > end_date:
+                        start_date, end_date = end_date, start_date
+                except ValueError:
+                    return jsonify({"error": "Invalid date format (expected YYYY-MM-DD)"}), 400
+            return _export_excel_wlr(rows, wlr_mode=wlr_mode,
+                                     target_year=target_year, target_week=target_week,
+                                     start_date=start_date, end_date=end_date)
 
     except Exception as e:
         app.logger.error(f"Excel export error: {e}", exc_info=True)
@@ -2822,7 +2864,7 @@ HTML = r"""<!DOCTYPE html>
     </p>
 
     <!-- Format Selection -->
-    <div style="margin-bottom:16px">
+    <div style="margin-bottom:14px">
       <label style="display:block;margin-bottom:8px;cursor:pointer;padding:10px;background:var(--bg3);border-radius:8px;border:2px solid transparent" id="format-wlr-label">
         <input type="radio" name="excel-format" value="WLR" id="format-wlr" checked style="margin-right:8px">
         <strong>WLR Format</strong> — Work Log Report
@@ -2837,6 +2879,43 @@ HTML = r"""<!DOCTYPE html>
           Simple task list with due dates and checkboxes
         </div>
       </label>
+    </div>
+
+    <!-- WLR Date Filter (shown only for WLR format) -->
+    <div id="wlr-filter-section" style="margin-bottom:14px">
+      <p style="font-size:12px;color:var(--fg2);margin-bottom:8px">Filter records by worklog activity:</p>
+      <div style="margin-bottom:8px">
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer;font-size:13px">
+          <input type="radio" name="wlr-mode" value="all" id="wlr-mode-all" checked style="width:auto;margin:0">
+          <span>All Worklogs (no filter)</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer;font-size:13px">
+          <input type="radio" name="wlr-mode" value="week" id="wlr-mode-week" style="width:auto;margin:0">
+          <span>By Week</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+          <input type="radio" name="wlr-mode" value="range" id="wlr-mode-range" style="width:auto;margin:0">
+          <span>By Date Range</span>
+        </label>
+      </div>
+      <!-- Week selector -->
+      <div id="wlr-week-section" style="display:none;margin-bottom:10px">
+        <select id="wlr-week-select" style="width:100%;padding:10px;font-size:13px">
+          <option value="all">Loading weeks...</option>
+        </select>
+      </div>
+      <!-- Date range inputs -->
+      <div id="wlr-range-section" style="display:none;margin-bottom:10px;padding:10px;background:var(--bg3);border-radius:8px">
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+          <label style="font-size:12px;width:70px">Start date:</label>
+          <input type="date" id="wlr-start-date" style="flex:1;padding:6px;font-size:13px">
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <label style="font-size:12px;width:70px">End date:</label>
+          <input type="date" id="wlr-end-date" style="flex:1;padding:6px;font-size:13px">
+        </div>
+      </div>
+      <div id="wlr-week-info" style="font-size:11px;color:var(--fg2);padding:8px;background:var(--bg3);border-radius:6px;display:none"></div>
     </div>
 
     <!-- Date Filter (shown only for To-Do format) -->
@@ -4191,34 +4270,78 @@ async function exportExcel() {
   openExcelSelect();
 }
 
-function openExcelSelect() {
+async function openExcelSelect() {
   document.getElementById('excel-overlay').style.display = 'flex';
 
-  // Setup format change listener to show/hide date filter
-  const wlrRadio = document.getElementById('format-wlr');
+  const wlrRadio  = document.getElementById('format-wlr');
   const todoRadio = document.getElementById('format-todo');
+  const wlrFilterSection  = document.getElementById('wlr-filter-section');
   const dateFilterSection = document.getElementById('date-filter-section');
-
-  const updateDateFilter = () => {
-    dateFilterSection.style.display = todoRadio.checked ? 'block' : 'none';
-  };
-
-  wlrRadio.addEventListener('change', updateDateFilter);
-  todoRadio.addEventListener('change', updateDateFilter);
-  updateDateFilter(); // Initial state
-
-  // Visual feedback for selected format
-  const wlrLabel = document.getElementById('format-wlr-label');
+  const wlrLabel  = document.getElementById('format-wlr-label');
   const todoLabel = document.getElementById('format-todo-label');
 
-  const updateLabels = () => {
-    wlrLabel.style.borderColor = wlrRadio.checked ? 'var(--accent)' : 'transparent';
+  // Wire up WLR mode radio toggles
+  const modeAll   = document.getElementById('wlr-mode-all');
+  const modeWeek  = document.getElementById('wlr-mode-week');
+  const modeRange = document.getElementById('wlr-mode-range');
+  const weekSec   = document.getElementById('wlr-week-section');
+  const rangeSec  = document.getElementById('wlr-range-section');
+  const updateWlrSections = () => {
+    weekSec.style.display  = modeWeek.checked  ? 'block' : 'none';
+    rangeSec.style.display = modeRange.checked ? 'block' : 'none';
+  };
+  modeAll.checked = true;
+  [modeAll, modeWeek, modeRange].forEach(r => { r.onchange = updateWlrSections; });
+  updateWlrSections();
+
+  // Default date range to last 7 days
+  const today = new Date();
+  const weekAgo = new Date(today.getTime() - 6 * 86400000);
+  const fmt = d => d.toISOString().slice(0, 10);
+  document.getElementById('wlr-start-date').value = fmt(weekAgo);
+  document.getElementById('wlr-end-date').value   = fmt(today);
+
+  // Load weeks for WLR week selector
+  const sel  = document.getElementById('wlr-week-select');
+  const info = document.getElementById('wlr-week-info');
+  sel.innerHTML = '<option value="loading">Loading weeks...</option>';
+  info.style.display = 'none';
+  try {
+    const res = await fetch('/api/export/weeks', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ ids: excelExportIds })
+    });
+    const weeks = await res.json();
+    sel.innerHTML = '';
+    if (weeks.length === 0) {
+      sel.innerHTML = '<option value="all">(No dated worklogs)</option>';
+      info.textContent = 'No dated worklogs found in selected records.';
+      info.style.display = 'block';
+    } else {
+      weeks.forEach(w => {
+        const opt = document.createElement('option');
+        opt.value = w.value;
+        opt.textContent = `${w.label}  (${w.range})`;
+        sel.appendChild(opt);
+      });
+    }
+  } catch (e) {
+    sel.innerHTML = '<option value="all">All Worklogs</option>';
+    info.textContent = 'Could not load weeks: ' + e.message;
+    info.style.display = 'block';
+  }
+
+  // Show/hide sections and update label borders based on selected format
+  const updateFormatSections = () => {
+    wlrFilterSection.style.display  = wlrRadio.checked  ? 'block' : 'none';
+    dateFilterSection.style.display = todoRadio.checked ? 'block' : 'none';
+    wlrLabel.style.borderColor  = wlrRadio.checked  ? 'var(--accent)' : 'transparent';
     todoLabel.style.borderColor = todoRadio.checked ? 'var(--accent)' : 'transparent';
   };
-
-  wlrRadio.addEventListener('change', updateLabels);
-  todoRadio.addEventListener('change', updateLabels);
-  updateLabels();
+  wlrRadio.onchange  = updateFormatSections;
+  todoRadio.onchange = updateFormatSections;
+  updateFormatSections();
 }
 
 function closeExcelSelect() {
@@ -4227,11 +4350,29 @@ function closeExcelSelect() {
 }
 
 async function confirmExcelExport() {
-  const format = document.querySelector('input[name="excel-format"]:checked').value;
+  const format     = document.querySelector('input[name="excel-format"]:checked').value;
   const dateFilter = document.querySelector('input[name="date-filter"]:checked').value;
 
-  // Save excelExportIds before closing (which clears excelExportIds)
-  const idsToExport = [...excelExportIds];
+  const payload = { ids: [...excelExportIds], format, date_filter: dateFilter };
+
+  if (format === 'WLR') {
+    const wlrMode = document.querySelector('input[name="wlr-mode"]:checked').value;
+    payload.wlr_mode = wlrMode;
+    if (wlrMode === 'week') {
+      const week = document.getElementById('wlr-week-select').value;
+      if (!week || week === 'loading') { toast('⚠ Please choose a week'); return; }
+      payload.wlr_week = week;
+    } else if (wlrMode === 'range') {
+      const start = document.getElementById('wlr-start-date').value;
+      const end   = document.getElementById('wlr-end-date').value;
+      if (!start || !end) { toast('⚠ Please select start and end dates'); return; }
+      payload.wlr_start_date = start;
+      payload.wlr_end_date   = end;
+    }
+  }
+
+  // Save ids before closing (which clears excelExportIds)
+  const idsToExport = payload.ids;
   closeExcelSelect();
   toast(`Generating Excel export...`);
 
@@ -4239,11 +4380,7 @@ async function confirmExcelExport() {
     const res = await fetch('/api/export/excel', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        ids: idsToExport,
-        format: format,
-        date_filter: dateFilter
-      })
+      body: JSON.stringify(payload)
     });
 
     if (!res.ok) {

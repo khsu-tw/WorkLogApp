@@ -8,6 +8,9 @@ Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
 - **PATCH** — backward-compatible bug fixes
 
 ---
+## [v1.0.8] — 2026-05-08
+- Excel 輸出 WLR Format 新增週次與自訂日期區間篩選功能，與 Word 輸出選項一致。篩選邏輯以 Worklog 紀錄的日期為依據，僅匯出在指定期間內有活動記錄的專案。
+
 ## [v1.0.7] — 2026-05-04
 - Word輸出增加指定日期區間設定，輸出內容與原Word輸出內容一樣。
 
